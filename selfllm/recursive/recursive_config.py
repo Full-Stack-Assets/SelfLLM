@@ -1,7 +1,7 @@
 """Configuration dataclass for the recursive self-improvement engine."""
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import Any, List, Optional
 
 
 @dataclass
@@ -98,3 +98,17 @@ class RecursiveConfig:
         "Evaluate the pros and cons of remote work versus office work.",
     ])
     eval_every: int = 1
+
+    # Eval-suite benchmark hook (MMLU / GSM8K / HumanEval). When
+    # ``run_benchmarks`` is True, the standardized benchmarks whose source is
+    # provided are run inside the recursive loop every ``benchmark_every``
+    # iterations and their scores are recorded in the metrics history under
+    # ``benchmark_<name>`` keys. Each source is a JSONL path or in-memory
+    # records (see ``selfllm.eval.run_all``); a ``None`` source is skipped.
+    run_benchmarks: bool = False
+    benchmark_every: int = 1
+    benchmark_limit: int = 20          # cap examples per benchmark for speed
+    benchmark_max_new_tokens: int = 16
+    mmlu_source: Optional[Any] = None
+    gsm8k_source: Optional[Any] = None
+    humaneval_source: Optional[Any] = None

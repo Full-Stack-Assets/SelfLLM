@@ -1,0 +1,9 @@
+{
+  "output_dir": "./real_model",
+  "total_parameters": "6766848",
+  "pretrain_loss": "6.1872012955801825",
+  "num_books": "0",
+  "dataset_size": "52",
+  "self_improve_iterations": "0",
+  "iteration_metrics": "[]"
+}

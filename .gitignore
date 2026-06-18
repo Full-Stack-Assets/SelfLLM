@@ -18,3 +18,7 @@ real_model/
 /real_train.log
 /checkpoints/
 /test_checkpoints/
+/data_small/
+/rt.log
+/rec.log
+/result.json

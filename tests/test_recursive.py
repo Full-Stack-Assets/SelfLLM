@@ -94,6 +94,59 @@ class TestRecursiveTrainer:
         return "cuda" if torch.cuda.is_available() else "cpu"
 
     # ------------------------------------------------------------------
+    # Eval-suite benchmark hook
+    # ------------------------------------------------------------------
+
+    def test_benchmark_hook_records_scores(
+        self,
+        model: SelfImprovingLLM,
+        tokenizer: BPETokenizer,
+        recursive_config: RecursiveConfig,
+        device: str,
+    ) -> None:
+        """The benchmark hook evaluates configured benchmarks and returns
+        a ``benchmark_<name>`` score dict to merge into the metrics."""
+        mmlu_records = [
+            {"question": "2+2=?", "choices": ["3", "4", "5", "6"],
+             "answer": "B", "subject": "math"},
+            {"question": "Capital of France?",
+             "choices": ["Rome", "Paris", "Berlin", "Madrid"],
+             "answer": "B", "subject": "geography"},
+        ]
+        gsm8k_records = [
+            {"question": "What is 2+3?", "answer": "Adding gives 5. #### 5"},
+            {"question": "What is 10-4?", "answer": "#### 6"},
+        ]
+        recursive_config.run_benchmarks = True
+        recursive_config.mmlu_source = mmlu_records
+        recursive_config.gsm8k_source = gsm8k_records
+        recursive_config.benchmark_limit = 2
+        recursive_config.benchmark_max_new_tokens = 4
+
+        trainer = RecursiveSelfTrainer(
+            model.to(device), tokenizer, recursive_config, device=device
+        )
+        scores = trainer._run_benchmarks()
+
+        assert "benchmark_mmlu" in scores
+        assert "benchmark_gsm8k" in scores
+        assert all(0.0 <= v <= 1.0 for v in scores.values())
+
+    def test_benchmark_hook_no_sources_returns_empty(
+        self,
+        model: SelfImprovingLLM,
+        tokenizer: BPETokenizer,
+        recursive_config: RecursiveConfig,
+        device: str,
+    ) -> None:
+        """With no benchmark sources configured the hook is a no-op."""
+        recursive_config.run_benchmarks = True  # enabled but no sources
+        trainer = RecursiveSelfTrainer(
+            model.to(device), tokenizer, recursive_config, device=device
+        )
+        assert trainer._run_benchmarks() == {}
+
+    # ------------------------------------------------------------------
     # 1. One iteration completes
     # ------------------------------------------------------------------
 
