@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -100,6 +100,9 @@ class ContinuousBatchingScheduler:
         self._shutdown = False
         self._total_requests_served = 0
 
+        # Per-request KV cache state: req.id -> {"past": [(k, v), ...], "cache_len": int}
+        self._req_cache: Dict[str, Dict[str, Any]] = {}
+
     def add_request(self, request: Request) -> None:
         """Thread-safe add request to waiting queue.
 
@@ -141,11 +144,14 @@ class ContinuousBatchingScheduler:
         return req
 
     def step(self) -> List[Request]:
-        """Run one generation step.
+        """Run one scheduler iteration.
 
-        1. Move waiting requests to active batch
-        2. For each active request, generate one token
-        3. Check for completion (EOS, max length)
+        1. Admit waiting requests into the active batch (respecting the batch
+           size and KV-cache block budget) and prefill each one.
+        2. Run a single *batched* decode forward over all active requests --
+           their per-request KV caches are right-padded to a common length and
+           masked, so one model forward advances every sequence by one token.
+        3. Retire finished requests (EOS / max length) and free their blocks.
 
         Returns:
             List of newly completed requests this step.
@@ -153,92 +159,183 @@ class ContinuousBatchingScheduler:
         completed: List[Request] = []
 
         with self._lock:
-            # Move waiting -> active
+            newly_admitted: List[Request] = []
             while (
                 len(self.active_requests) < self.max_batch_size
                 and self.waiting_queue
             ):
-                req = self.waiting_queue.pop(0)
+                req = self.waiting_queue[0]
                 try:
-                    num_tokens = len(req.prompt_tokens)
-                    req.block_ids = self.block_manager.allocate(num_tokens)
-                    req.status = "running"
-                    self.active_requests.append(req)
+                    req.block_ids = self.block_manager.allocate(
+                        max(1, len(req.prompt_tokens))
+                    )
                 except RuntimeError:
-                    # Out of blocks, put back and stop adding more
-                    self.waiting_queue.insert(0, req)
-                    break
-
-            if not self.active_requests:
-                return completed
+                    break  # out of blocks; retry next step
+                self.waiting_queue.pop(0)
+                req.status = "running"
+                self.active_requests.append(req)
+                newly_admitted.append(req)
 
             active = list(self.active_requests)
 
-        # For each active request, generate one token
-        for req in active:
+        newly_ids = {r.id for r in newly_admitted}
+
+        # Prefill newly admitted requests (build their KV cache + first token).
+        for req in newly_admitted:
             try:
-                # Feed the full running context (prompt + everything generated
-                # so far). model.generate() keeps no KV cache across separate
-                # calls, so passing only the last token would condition each
-                # step on a single token and discard all prior context.
-                context = req.prompt_tokens + req.generated_tokens
-                input_ids = torch.tensor([context], device=self.device)
-
-                # Generate one token using the model
-                with torch.no_grad():
-                    output = self.model.generate(
-                        input_ids,
-                        max_new_tokens=1,
-                        temperature=req.temperature,
-                        top_p=req.top_p,
-                        top_k=req.top_k,
-                        stop_token_id=self.tokenizer.eos_token_id,
-                    )
-
-                new_token = output["sequences"][0, -1].item()
-                req.generated_tokens.append(new_token)
-
-                # Extend block allocation if needed
-                req.block_ids = self.block_manager.append_token(req.block_ids)
-
-                # Check completion conditions
-                if new_token == self.tokenizer.eos_token_id:
-                    req.status = "finished"
-                    req.finished_at = time.time()
-                    req.finish_reason = "stop"
-                    completed.append(req)
-
-                    with self._lock:
-                        self.active_requests.remove(req)
-                        self.completed_requests.append(req)
-                        self.block_manager.free(req.block_ids)
-                        self._total_requests_served += 1
-
-                elif len(req.generated_tokens) >= req.max_new_tokens:
-                    req.status = "finished"
-                    req.finished_at = time.time()
-                    req.finish_reason = "length"
-                    completed.append(req)
-
-                    with self._lock:
-                        self.active_requests.remove(req)
-                        self.completed_requests.append(req)
-                        self.block_manager.free(req.block_ids)
-                        self._total_requests_served += 1
-
+                self._prefill(req)
             except Exception:
-                req.status = "finished"
-                req.finished_at = time.time()
-                req.finish_reason = "error"
+                self._finish(req, "error")
+                completed.append(req)
+                continue
+            if self._check_complete(req):
+                completed.append(req)
 
-                with self._lock:
-                    if req in self.active_requests:
-                        self.active_requests.remove(req)
-                        self.completed_requests.append(req)
-                        self.block_manager.free(req.block_ids)
-                        self._total_requests_served += 1
+        # Batched decode for requests that already have a cache and need more
+        # tokens (exclude the ones just prefilled this step).
+        decode_reqs = [
+            r
+            for r in active
+            if r.id not in newly_ids
+            and not r.is_finished
+            and r.id in self._req_cache
+            and len(r.generated_tokens) < r.max_new_tokens
+        ]
+        if decode_reqs:
+            try:
+                self._batched_decode(decode_reqs)
+            except Exception:
+                for req in decode_reqs:
+                    self._finish(req, "error")
+                    completed.append(req)
+                decode_reqs = []
+            for req in decode_reqs:
+                if self._check_complete(req):
+                    completed.append(req)
+
+        # Retire finished requests and free their blocks.
+        with self._lock:
+            for req in completed:
+                if req in self.active_requests:
+                    self.active_requests.remove(req)
+                self.completed_requests.append(req)
+                self.block_manager.free(req.block_ids)
+                self._req_cache.pop(req.id, None)
+                self._total_requests_served += 1
 
         return completed
+
+    # ------------------------------------------------------------------ #
+    # Decoding internals
+    # ------------------------------------------------------------------ #
+
+    def _prefill(self, req: Request) -> None:
+        """Prefill a request's prompt, storing its KV cache and first token."""
+        max_len = getattr(getattr(self.model, "config", None), "max_seq_len", 2048)
+        prompt = req.prompt_tokens[-max_len:] if req.prompt_tokens else [0]
+        input_ids = torch.tensor([prompt], device=self.device)
+        with torch.no_grad():
+            out = self.model.forward(input_ids, use_cache=True)
+        past = out["past_key_values"]
+        logits = out["logits"][0, -1]
+        token = self._sample(logits, req)
+        self._req_cache[req.id] = {"past": past, "cache_len": past[0][0].shape[2]}
+        req.generated_tokens.append(token)
+        req.block_ids = self.block_manager.append_token(req.block_ids)
+
+    def _batched_decode(self, reqs: List[Request]) -> None:
+        """Advance every request in ``reqs`` by one token in a single forward."""
+        n_layers = len(self._req_cache[reqs[0].id]["past"])
+        sample_k = self._req_cache[reqs[0].id]["past"][0][0]
+        n_heads, head_dim = sample_k.shape[1], sample_k.shape[3]
+        lens = [self._req_cache[r.id]["cache_len"] for r in reqs]
+        L = max(lens)
+
+        # Right-pad each request's cache to the common length L per layer.
+        padded: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for layer in range(n_layers):
+            ks, vs = [], []
+            for r, ln in zip(reqs, lens):
+                k, v = self._req_cache[r.id]["past"][layer]
+                if ln < L:
+                    pad = k.new_zeros(1, n_heads, L - ln, head_dim)
+                    k = torch.cat([k, pad], dim=2)
+                    v = torch.cat([v, pad.clone()], dim=2)
+                ks.append(k)
+                vs.append(v)
+            padded.append((torch.cat(ks, dim=0), torch.cat(vs, dim=0)))
+
+        tokens = torch.tensor(
+            [[r.generated_tokens[-1]] for r in reqs], device=self.device
+        )
+        positions = torch.tensor([[ln] for ln in lens], device=self.device)
+        ar = torch.arange(L, device=self.device)
+        kpm = torch.stack([ar < ln for ln in lens])  # [B, L] bool
+
+        with torch.no_grad():
+            out = self.model.forward(
+                tokens,
+                past_key_values=padded,
+                use_cache=True,
+                positions=positions,
+                key_padding_mask=kpm,
+            )
+        logits = out["logits"][:, -1]  # [B, V]
+        new_caches = out["past_key_values"]  # list of (k, v) [B, H, L+1, hd]
+
+        for i, r in enumerate(reqs):
+            ln = lens[i]
+            token = self._sample(logits[i], r)
+            r.generated_tokens.append(token)
+            r.block_ids = self.block_manager.append_token(r.block_ids)
+            # Extract this request's own contiguous cache: real keys [0, ln)
+            # plus the newly appended key at index L.
+            new_past: List[Tuple[torch.Tensor, torch.Tensor]] = []
+            for layer in range(n_layers):
+                k, v = new_caches[layer]
+                kk = torch.cat([k[i : i + 1, :, :ln, :], k[i : i + 1, :, L : L + 1, :]], dim=2)
+                vv = torch.cat([v[i : i + 1, :, :ln, :], v[i : i + 1, :, L : L + 1, :]], dim=2)
+                new_past.append((kk, vv))
+            self._req_cache[r.id] = {"past": new_past, "cache_len": ln + 1}
+
+    def _sample(self, logits: torch.Tensor, req: Request) -> int:
+        """Sample one token id from a ``[vocab]`` logits row using req params."""
+        logits = logits.clone().float()
+        if req.temperature == 0.0:
+            return int(torch.argmax(logits).item())
+        logits = logits / req.temperature
+        if req.top_k and req.top_k > 0:
+            k = min(req.top_k, logits.size(-1))
+            vals, _ = torch.topk(logits, k)
+            logits[logits < vals[-1]] = float("-inf")
+        if req.top_p and req.top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+            cum = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+            remove = cum > req.top_p
+            remove[1:] = remove[:-1].clone()
+            remove[0] = False
+            logits[sorted_idx[remove]] = float("-inf")
+        probs = torch.softmax(logits, dim=-1)
+        return int(torch.multinomial(probs, num_samples=1).item())
+
+    def _check_complete(self, req: Request) -> bool:
+        """Mark req finished if it hit EOS or its length cap. Returns True if so."""
+        if req.is_finished:
+            return False
+        last = req.generated_tokens[-1] if req.generated_tokens else None
+        if last is not None and last == self.tokenizer.eos_token_id:
+            self._finish(req, "stop")
+            return True
+        if len(req.generated_tokens) >= req.max_new_tokens:
+            self._finish(req, "length")
+            return True
+        return False
+
+    def _finish(self, req: Request, reason: str) -> None:
+        """Set a request's terminal status."""
+        req.status = "finished"
+        req.finished_at = time.time()
+        req.finish_reason = reason
 
     def run(self) -> None:
         """Run the continuous batching loop.

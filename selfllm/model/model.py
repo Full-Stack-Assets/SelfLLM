@@ -97,6 +97,8 @@ class SelfImprovingLLM(nn.Module):
         targets: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
+        positions: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """Forward pass through the model.
 
@@ -109,6 +111,10 @@ class SelfImprovingLLM(nn.Module):
                      ``token_ids`` should contain only the new tokens.
             use_cache: If ``True``, return the updated per-layer KV caches under
                      the ``past_key_values`` key.
+            positions: Optional per-row absolute positions ``[batch, seq_len]``
+                     for batched continuous-batch decoding.
+            key_padding_mask: Optional cached-key validity mask ``[batch, cache_len]``
+                     for batched decoding over right-padded caches.
 
         Returns:
             Dictionary with keys:
@@ -137,7 +143,12 @@ class SelfImprovingLLM(nn.Module):
             layer_past = past_key_values[i] if past_key_values is not None else None
             if use_cache:
                 x, layer_cache = block(
-                    x, mask=mask, kv_cache=layer_past, use_cache=True
+                    x,
+                    mask=mask,
+                    kv_cache=layer_past,
+                    use_cache=True,
+                    positions=positions,
+                    key_padding_mask=key_padding_mask,
                 )
                 new_caches.append(layer_cache)
             elif self.config.grad_checkpoint and self.training:

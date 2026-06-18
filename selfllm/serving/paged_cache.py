@@ -259,6 +259,29 @@ class PagedAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
 
+        # Precomputed RoPE frequencies so paged decode applies the same
+        # positional encoding as the dense attention path.
+        dim_idx = torch.arange(0, head_dim, 2, dtype=torch.float64)
+        inv_freq = 1.0 / (10000.0 ** (dim_idx / head_dim))
+        positions = torch.arange(max_seq_len, dtype=torch.float64)
+        self.register_buffer(
+            "rope_freqs",
+            torch.outer(positions, inv_freq).float(),  # [max_seq_len, head_dim//2]
+            persistent=False,
+        )
+
+    def _apply_rope(self, x: torch.Tensor, position: int) -> torch.Tensor:
+        """Rotate ``x`` ``[batch, 1, n_heads, head_dim]`` at a single absolute position."""
+        pos = min(position, self.rope_freqs.shape[0] - 1)
+        freqs = self.rope_freqs[pos]  # [head_dim//2]
+        cos = torch.cos(freqs).view(1, 1, 1, -1)
+        sin = torch.sin(freqs).view(1, 1, 1, -1)
+        x1 = x[..., 0::2]
+        x2 = x[..., 1::2]
+        rx1 = x1 * cos - x2 * sin
+        rx2 = x1 * sin + x2 * cos
+        return torch.stack([rx1, rx2], dim=-1).view_as(x)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -288,6 +311,12 @@ class PagedAttention(nn.Module):
         q = self.q_proj(x).view(batch_size, 1, self.n_heads, self.head_dim)
         k = self.k_proj(x).view(batch_size, 1, self.n_heads, self.head_dim)
         v = self.v_proj(x).view(batch_size, 1, self.n_heads, self.head_dim)
+
+        # Apply RoPE at the current absolute position. K is rotated *before*
+        # being written, so cached keys are stored already-rotated and the
+        # attention below is positionally consistent.
+        q = self._apply_rope(q, position)
+        k = self._apply_rope(k, position)
 
         # Write new K, V to cache
         for b in range(batch_size):

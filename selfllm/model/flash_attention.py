@@ -323,6 +323,8 @@ class HybridAttention(nn.Module):
         kv_cache: Optional[Any] = None,
         is_prefill: bool = True,
         use_cache: bool = False,
+        positions: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[Any]]:
         """Forward pass -- delegates to the selected backend.
 
@@ -330,8 +332,12 @@ class HybridAttention(nn.Module):
         get a single contract: when ``use_cache`` is ``True`` an updated KV
         cache is always returned (and populated on prefill); when it is
         ``False`` the returned cache is ``None``.
+
+        ``positions`` / ``key_padding_mask`` support batched continuous-batch
+        decoding and are only honoured by the standard backend (the batched
+        serving path runs on that backend).
         """
-        if self.backend == "flash_attn":
+        if self.backend == "flash_attn" and key_padding_mask is None and positions is None:
             # FlashAttention2 only populates a cache when one is passed in, so
             # seed an empty cache on prefill to capture the prompt's K/V.
             if use_cache and kv_cache is None:
@@ -343,10 +349,26 @@ class HybridAttention(nn.Module):
             out, new_cache = self.attn(
                 x, mask=mask, kv_cache=kv_cache, is_prefill=is_prefill
             )
+        elif self.backend == "flash_attn":
+            # Batched decode with padding/positions: use the standard RoPE
+            # attention math against the flash module's projections is not
+            # supported, so fall back to the flash module's own path without
+            # the padding mask is unsafe -- instead require the standard
+            # backend for batched serving.
+            raise NotImplementedError(
+                "Batched continuous-batch decoding (positions/key_padding_mask) "
+                "requires the standard attention backend; flash_attn is not "
+                "supported for this path."
+            )
         else:
-            # Standard backend (RoPEMultiHeadAttention) does not accept
-            # is_prefill and always returns the updated cache.
-            out, new_cache = self.attn(x, mask=mask, kv_cache=kv_cache)
+            # Standard backend (RoPEMultiHeadAttention).
+            out, new_cache = self.attn(
+                x,
+                mask=mask,
+                kv_cache=kv_cache,
+                positions=positions,
+                key_padding_mask=key_padding_mask,
+            )
         return out, (new_cache if use_cache else None)
 
     @property

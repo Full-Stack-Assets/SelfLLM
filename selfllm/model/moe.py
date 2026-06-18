@@ -314,6 +314,8 @@ class MoETransformerBlock(nn.Module):
         mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[Any] = None,
         use_cache: bool = False,
+        positions: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
     ):
         """Forward pass through the MoE transformer block.
 
@@ -322,6 +324,8 @@ class MoETransformerBlock(nn.Module):
             mask: Optional causal mask tensor.
             kv_cache: Optional key/value cache for incremental decoding.
             use_cache: If ``True``, also return the updated KV cache.
+            positions: Optional per-row absolute positions for batched decode.
+            key_padding_mask: Optional cached-key validity mask for batched decode.
 
         Returns:
             Output tensor ``[batch, seq_len, d_model]``, or a
@@ -329,7 +333,12 @@ class MoETransformerBlock(nn.Module):
         """
         # Pre-norm attention with residual
         attn_out, new_cache = self.attn(
-            self.attn_norm(x), mask=mask, kv_cache=kv_cache, use_cache=use_cache
+            self.attn_norm(x),
+            mask=mask,
+            kv_cache=kv_cache,
+            use_cache=use_cache,
+            positions=positions,
+            key_padding_mask=key_padding_mask,
         )
         x = x + attn_out
 

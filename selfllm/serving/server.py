@@ -11,8 +11,10 @@ The server integrates with PagedAttention KV cache and continuous batching
 for efficient concurrent request handling.
 """
 
+import asyncio
 import json
 import logging
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -131,23 +133,29 @@ async def chat_completions(request: ChatCompletionRequest):
 
     # Non-streaming: generate all at once
     req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-    device = next(_model.parameters()).device
 
-    input_ids = torch.tensor([prompt_tokens], device=device)
-    with torch.no_grad():
-        output = _model.generate(
-            input_ids,
-            max_new_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            stop_token_id=_tokenizer.eos_token_id,
-        )
-
-    all_token_ids = output["sequences"][0].tolist()
-    generated_text = _tokenizer.decode(all_token_ids)
-    response_text = generated_text[len(prompt) :]
-
-    completion_tokens = len(output["sequences"][0]) - len(prompt_tokens)
+    if _scheduler is not None:
+        # Route through the continuous-batching scheduler so concurrent
+        # requests share batched forward passes.
+        gen_ids = await _generate_via_scheduler(prompt_tokens, request)
+        response_text = _tokenizer.decode(gen_ids)
+        completion_tokens = len(gen_ids)
+    else:
+        # Fallback: decode directly when no scheduler is configured.
+        device = next(_model.parameters()).device
+        input_ids = torch.tensor([prompt_tokens], device=device)
+        with torch.no_grad():
+            output = _model.generate(
+                input_ids,
+                max_new_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                stop_token_id=_tokenizer.eos_token_id,
+            )
+        all_token_ids = output["sequences"][0].tolist()
+        generated_text = _tokenizer.decode(all_token_ids)
+        response_text = generated_text[len(prompt) :]
+        completion_tokens = max(0, len(output["sequences"][0]) - len(prompt_tokens))
 
     return ChatCompletionResponse(
         id=req_id,
@@ -185,21 +193,35 @@ async def completions(request: CompletionRequest):
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     prompt_tokens = _tokenizer.encode(request.prompt)
-    device = next(_model.parameters()).device
 
-    input_ids = torch.tensor([prompt_tokens], device=device)
-    with torch.no_grad():
-        output = _model.generate(
-            input_ids,
-            max_new_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            stop_token_id=_tokenizer.eos_token_id,
+    if _scheduler is not None:
+        gen_ids = await _generate_via_scheduler(
+            prompt_tokens,
+            ChatCompletionRequest(
+                model=request.model,
+                messages=[],
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+            ),
         )
-
-    all_token_ids = output["sequences"][0].tolist()
-    generated_text = _tokenizer.decode(all_token_ids)
-    response_text = generated_text[len(request.prompt) :]
+        response_text = _tokenizer.decode(gen_ids)
+        completion_tokens = len(gen_ids)
+    else:
+        device = next(_model.parameters()).device
+        input_ids = torch.tensor([prompt_tokens], device=device)
+        with torch.no_grad():
+            output = _model.generate(
+                input_ids,
+                max_new_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                stop_token_id=_tokenizer.eos_token_id,
+            )
+        all_token_ids = output["sequences"][0].tolist()
+        generated_text = _tokenizer.decode(all_token_ids)
+        response_text = generated_text[len(request.prompt) :]
+        completion_tokens = max(0, len(output["sequences"][0]) - len(prompt_tokens))
 
     return {
         "id": f"cmpl-{uuid.uuid4().hex[:12]}",
@@ -211,8 +233,8 @@ async def completions(request: CompletionRequest):
         ],
         "usage": {
             "prompt_tokens": len(prompt_tokens),
-            "completion_tokens": len(output["sequences"][0]) - len(prompt_tokens),
-            "total_tokens": len(output["sequences"][0]),
+            "completion_tokens": completion_tokens,
+            "total_tokens": len(prompt_tokens) + completion_tokens,
         },
     }
 
@@ -305,6 +327,12 @@ async def _stream_generate(
     Yields:
         SSE-formatted strings with generated token content.
     """
+    # Route through the continuous-batching scheduler when one is configured.
+    if _scheduler is not None:
+        async for chunk in _stream_via_scheduler(prompt_tokens, request):
+            yield chunk
+        return
+
     device = next(_model.parameters()).device
 
     # Track the full running context. Each step regenerates from the complete
@@ -359,6 +387,67 @@ def _first_stop_index(text: str, stop_sequences: List[str]) -> Optional[int]:
         if idx != -1 and (best is None or idx < best):
             best = idx
     return best
+
+
+async def _generate_via_scheduler(
+    prompt_tokens: List[int], request: ChatCompletionRequest
+) -> List[int]:
+    """Submit a request to the scheduler and await completion.
+
+    Returns the generated token ids (excluding a trailing EOS token).
+    """
+    req = _scheduler.create_request(
+        prompt_tokens=prompt_tokens,
+        max_new_tokens=request.max_tokens,
+        temperature=request.temperature,
+        top_p=request.top_p,
+    )
+    while not req.is_finished:
+        await asyncio.sleep(0.005)
+    gen = list(req.generated_tokens)
+    if gen and gen[-1] == _tokenizer.eos_token_id:
+        gen = gen[:-1]
+    return gen
+
+
+async def _stream_via_scheduler(
+    prompt_tokens: List[int], request: ChatCompletionRequest
+) -> AsyncGenerator[str, None]:
+    """Stream a scheduler-driven request token-by-token as SSE events."""
+    req = _scheduler.create_request(
+        prompt_tokens=prompt_tokens,
+        max_new_tokens=request.max_tokens,
+        temperature=request.temperature,
+        top_p=request.top_p,
+    )
+    stop_sequences = request.stop or []
+    emitted_text = ""
+    emitted_count = 0
+
+    while True:
+        gen = list(req.generated_tokens)
+        # Don't display a trailing EOS token.
+        display = gen[:-1] if (gen and gen[-1] == _tokenizer.eos_token_id) else gen
+
+        if len(display) > emitted_count:
+            full_text = _tokenizer.decode(display)
+            stop_idx = _first_stop_index(full_text, stop_sequences)
+            if stop_idx is not None:
+                remaining = full_text[len(emitted_text):stop_idx]
+                if remaining:
+                    yield f"data: {json.dumps({'choices': [{'delta': {'content': remaining}}]})}\n\n"
+                break
+            new_text = full_text[len(emitted_text):]
+            if new_text:
+                yield f"data: {json.dumps({'choices': [{'delta': {'content': new_text}}]})}\n\n"
+                emitted_text = full_text
+            emitted_count = len(display)
+
+        if req.is_finished and emitted_count >= len(display):
+            break
+        await asyncio.sleep(0.005)
+
+    yield "data: [DONE]\n\n"
 
 
 def serve(
@@ -438,6 +527,11 @@ def serve(
         max_batch_size=max_batch_size,
         device=device,
     )
+
+    # Drive the scheduler in a background thread so the HTTP endpoints can
+    # enqueue requests and await their completion while batched decoding runs.
+    scheduler_thread = threading.Thread(target=_scheduler.run, daemon=True)
+    scheduler_thread.start()
 
     param_count = sum(p.numel() for p in _model.parameters()) / 1e6
     logger.info(f"Server ready on {host}:{port}")
