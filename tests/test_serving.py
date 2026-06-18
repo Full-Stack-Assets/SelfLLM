@@ -1,0 +1,693 @@
+"""Tests for the serving system (scheduler + server)."""
+
+import threading
+import time
+from typing import Any, Dict, List
+from unittest.mock import MagicMock
+
+import pytest
+import torch
+
+from selfllm.serving.paged_cache import BlockManager
+from selfllm.serving.scheduler import ContinuousBatchingScheduler, Request
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mock_model():
+    """Create a mock model with a generate() method."""
+    model = MagicMock()
+    model.generate.return_value = {
+        "sequences": torch.tensor([[42, 99]]),  # 42 is prompt, 99 is generated
+    }
+    # Mock parameters() for device detection — must return an iterator
+    param = MagicMock()
+    param.device = torch.device("cpu")
+    model.parameters.return_value = iter([param])
+    return model
+
+
+@pytest.fixture
+def mock_tokenizer():
+    """Create a mock tokenizer."""
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 1
+    tokenizer.encode.return_value = [10, 20, 30]
+    tokenizer.decode.return_value = "hello world"
+    return tokenizer
+
+
+@pytest.fixture
+def block_manager():
+    """Create a BlockManager for testing."""
+    return BlockManager(
+        num_blocks=20,
+        block_size=4,
+        num_layers=2,
+        num_heads=4,
+        head_dim=32,
+        dtype=torch.float32,
+        device="cpu",
+    )
+
+
+@pytest.fixture
+def scheduler(mock_model, mock_tokenizer, block_manager):
+    """Create a ContinuousBatchingScheduler for testing."""
+    return ContinuousBatchingScheduler(
+        model=mock_model,
+        tokenizer=mock_tokenizer,
+        block_manager=block_manager,
+        max_batch_size=4,
+        device="cpu",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Request tests
+# ---------------------------------------------------------------------------
+
+
+class TestRequest:
+    """Tests for the Request dataclass."""
+
+    def test_request_creation(self):
+        """Request can be created with default values."""
+        req = Request(id="test-1", prompt_tokens=[1, 2, 3])
+        assert req.id == "test-1"
+        assert req.prompt_tokens == [1, 2, 3]
+        assert req.max_new_tokens == 256
+        assert req.temperature == 1.0
+        assert req.top_p == 1.0
+        assert req.status == "waiting"
+        assert req.generated_tokens == []
+        assert not req.is_finished
+
+    def test_request_total_tokens(self):
+        """total_tokens counts prompt + generated."""
+        req = Request(id="test-1", prompt_tokens=[1, 2, 3], generated_tokens=[4, 5])
+        assert req.total_tokens == 5
+
+    def test_request_is_finished(self):
+        """is_finished is True when status is 'finished'."""
+        req = Request(id="test-1", prompt_tokens=[1, 2, 3], status="finished")
+        assert req.is_finished
+
+    def test_request_latency(self):
+        """latency is computed correctly when finished."""
+        now = time.time()
+        req = Request(
+            id="test-1",
+            prompt_tokens=[1, 2, 3],
+            status="finished",
+            created_at=now,
+            finished_at=now + 1.5,
+        )
+        assert req.latency is not None
+        assert abs(req.latency - 1.5) < 0.01
+
+    def test_request_latency_not_finished(self):
+        """latency is None when not finished."""
+        req = Request(id="test-1", prompt_tokens=[1, 2, 3], status="running")
+        assert req.latency is None
+
+
+# ---------------------------------------------------------------------------
+# Scheduler tests
+# ---------------------------------------------------------------------------
+
+
+class TestSchedulerInit:
+    """Tests for ContinuousBatchingScheduler initialization."""
+
+    def test_scheduler_init(self, scheduler, mock_model, mock_tokenizer, block_manager):
+        """Scheduler initializes correctly."""
+        assert scheduler.model is mock_model
+        assert scheduler.tokenizer is mock_tokenizer
+        assert scheduler.block_manager is block_manager
+        assert scheduler.max_batch_size == 4
+        assert scheduler.num_active_requests == 0
+
+    def test_scheduler_empty_stats(self, scheduler):
+        """Stats reflect empty state."""
+        stats = scheduler.stats
+        assert stats["active"] == 0
+        assert stats["waiting"] == 0
+        assert stats["completed"] == 0
+        assert stats["free_blocks"] == 20
+        assert stats["total_served"] == 0
+
+
+class TestSchedulerAddRequest:
+    """Tests for adding requests to the scheduler."""
+
+    def test_add_request(self, scheduler):
+        """add_request() adds to waiting queue."""
+        req = Request(id="test-1", prompt_tokens=[1, 2, 3])
+        scheduler.add_request(req)
+        assert scheduler.stats["waiting"] == 1
+        assert scheduler.stats["active"] == 0
+
+    def test_create_request(self, scheduler):
+        """create_request() creates and enqueues a request."""
+        req = scheduler.create_request(prompt_tokens=[1, 2, 3], max_new_tokens=10)
+        assert isinstance(req, Request)
+        assert req.prompt_tokens == [1, 2, 3]
+        assert req.max_new_tokens == 10
+        assert scheduler.stats["waiting"] == 1
+
+
+class TestSchedulerStep:
+    """Tests for scheduler.step()."""
+
+    def test_step_moves_waiting_to_active(self, scheduler):
+        """step() moves waiting requests to active."""
+        req = scheduler.create_request(prompt_tokens=[1, 2, 3])
+        assert scheduler.stats["waiting"] == 1
+
+        scheduler.step()
+        assert scheduler.stats["active"] == 1
+        assert scheduler.stats["waiting"] == 0
+        assert req.status == "running"
+
+    def test_step_generates_token(self, scheduler, mock_model):
+        """step() generates a token for active requests."""
+        req = scheduler.create_request(prompt_tokens=[1, 2, 3], max_new_tokens=5)
+        scheduler.step()  # Move to active and generate first token
+
+        mock_model.generate.assert_called()
+        assert len(req.generated_tokens) == 1
+        assert req.generated_tokens[0] == 99  # From mock return value
+
+    def test_step_completes_on_eos(self, scheduler, mock_tokenizer):
+        """step() marks request finished on EOS token."""
+        mock_tokenizer.eos_token_id = 99
+        req = scheduler.create_request(prompt_tokens=[1, 2, 3], max_new_tokens=5)
+
+        scheduler.step()  # Generates token 99 which equals EOS
+        assert req.is_finished
+        assert req.finish_reason == "stop"
+        assert scheduler.stats["active"] == 0
+        assert scheduler.stats["completed"] == 1
+
+    def test_step_completes_on_max_length(self, scheduler):
+        """step() marks request finished when max_new_tokens reached."""
+        req = scheduler.create_request(prompt_tokens=[1, 2, 3], max_new_tokens=1)
+        scheduler.step()
+
+        # After generating 1 token, should be finished due to max length
+        assert req.is_finished
+        assert req.finish_reason == "length"
+
+    def test_step_no_requests(self, scheduler):
+        """step() with no requests returns empty list."""
+        completed = scheduler.step()
+        assert completed == []
+
+    def test_step_multiple_requests(self, scheduler):
+        """step() handles multiple active requests."""
+        req1 = scheduler.create_request(prompt_tokens=[1, 2], max_new_tokens=1)
+        req2 = scheduler.create_request(prompt_tokens=[3, 4], max_new_tokens=1)
+
+        scheduler.step()
+
+        assert scheduler.stats["completed"] == 2
+        assert len(req1.generated_tokens) == 1
+        assert len(req2.generated_tokens) == 1
+
+    def test_step_respects_max_batch_size(self, scheduler):
+        """step() respects max_batch_size limit."""
+        scheduler.max_batch_size = 2
+
+        # Create 4 requests
+        for i in range(4):
+            scheduler.create_request(prompt_tokens=[i], max_new_tokens=1)
+
+        assert scheduler.stats["waiting"] == 4
+        scheduler.step()
+
+        # Only 2 should be active/completed, 2 still waiting
+        assert scheduler.stats["completed"] == 2
+        assert scheduler.stats["waiting"] == 2
+
+
+class TestSchedulerRun:
+    """Tests for scheduler.run() (continuous loop)."""
+
+    def test_run_and_shutdown(self, scheduler):
+        """run() processes requests and shutdown() stops it."""
+        req = scheduler.create_request(prompt_tokens=[1, 2, 3], max_new_tokens=1)
+
+        # Run in background thread
+        thread = threading.Thread(target=scheduler.run)
+        thread.start()
+
+        # Wait for request to complete
+        timeout = 5.0
+        start = time.time()
+        while not req.is_finished and (time.time() - start) < timeout:
+            time.sleep(0.05)
+
+        scheduler.shutdown()
+        thread.join(timeout=2.0)
+
+        assert req.is_finished
+
+    def test_run_idle_sleep(self, scheduler):
+        """run() sleeps when idle."""
+        thread = threading.Thread(target=scheduler.run)
+        thread.start()
+
+        time.sleep(0.05)  # Let it enter idle loop
+
+        scheduler.shutdown()
+        thread.join(timeout=2.0)
+
+        assert not thread.is_alive()
+
+
+class TestSchedulerGetRequestResult:
+    """Tests for scheduler.get_request_result()."""
+
+    def test_get_active_request(self, scheduler):
+        """get_request_result() finds active requests."""
+        req = scheduler.create_request(prompt_tokens=[1, 2, 3], max_new_tokens=5)
+        scheduler.step()  # Moves to active
+
+        found = scheduler.get_request_result(req.id)
+        assert found is not None
+        assert found.id == req.id
+
+    def test_get_waiting_request(self, scheduler):
+        """get_request_result() finds waiting requests."""
+        req = scheduler.create_request(prompt_tokens=[1, 2, 3])
+
+        found = scheduler.get_request_result(req.id)
+        assert found is not None
+        assert found.id == req.id
+
+    def test_get_completed_request(self, scheduler):
+        """get_request_result() finds completed requests."""
+        req = scheduler.create_request(prompt_tokens=[1, 2, 3], max_new_tokens=1)
+        scheduler.step()  # Completes immediately
+
+        found = scheduler.get_request_result(req.id)
+        assert found is not None
+        assert found.id == req.id
+        assert found.is_finished
+
+    def test_get_missing_request(self, scheduler):
+        """get_request_result() returns None for unknown IDs."""
+        found = scheduler.get_request_result("nonexistent")
+        assert found is None
+
+
+class TestSchedulerStats:
+    """Tests for scheduler.stats."""
+
+    def test_stats_with_active(self, scheduler):
+        """stats reflect active requests."""
+        scheduler.create_request(prompt_tokens=[1, 2, 3], max_new_tokens=5)
+        scheduler.step()
+
+        stats = scheduler.stats
+        assert stats["active"] == 1
+        assert stats["waiting"] == 0
+        assert stats["free_blocks"] < 20  # Some blocks allocated
+
+    def test_stats_with_waiting(self, scheduler):
+        """stats reflect waiting requests."""
+        scheduler.create_request(prompt_tokens=[1, 2, 3])
+
+        stats = scheduler.stats
+        assert stats["active"] == 0
+        assert stats["waiting"] == 1
+
+    def test_stats_total_served(self, scheduler):
+        """total_served increments as requests complete."""
+        scheduler.create_request(prompt_tokens=[1, 2, 3], max_new_tokens=1)
+        scheduler.step()
+
+        assert scheduler.stats["total_served"] == 1
+
+        scheduler.create_request(prompt_tokens=[4, 5], max_new_tokens=1)
+        scheduler.step()
+
+        assert scheduler.stats["total_served"] == 2
+
+    def test_stats_after_free(self, scheduler):
+        """Free blocks return to pool after request completes."""
+        initial_free = scheduler.block_manager.num_free_blocks
+        scheduler.create_request(prompt_tokens=[1, 2, 3], max_new_tokens=1)
+        scheduler.step()
+
+        # After completion, blocks should be freed
+        assert scheduler.block_manager.num_free_blocks == initial_free
+
+
+# ---------------------------------------------------------------------------
+# Server endpoint tests (using FastAPI TestClient)
+# ---------------------------------------------------------------------------
+
+
+class TestServerEndpoints:
+    """Tests for FastAPI server endpoints.
+
+    These tests use httpx's TestClient to test the FastAPI app without
+    actually starting a server.
+    """
+
+    @pytest.fixture
+    def client(self, mock_model, mock_tokenizer, monkeypatch):
+        """Create a TestClient with mocked global state."""
+        from fastapi.testclient import TestClient
+        from selfllm.serving.server import app, _model, _tokenizer, _scheduler
+
+        # We need to reload the module to pick up the app
+        import selfllm.serving.server as server_module
+
+        # Set the globals
+        monkeypatch.setattr(server_module, "_model", mock_model)
+        monkeypatch.setattr(server_module, "_tokenizer", mock_tokenizer)
+        monkeypatch.setattr(server_module, "_scheduler", None)
+
+        return TestClient(app)
+
+    def test_health_endpoint_no_model(self):
+        """/health returns not loaded when model is None."""
+        from fastapi.testclient import TestClient
+        from selfllm.serving.server import app
+
+        with TestClient(app) as client:
+            response = client.get("/health")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["status"] == "healthy"
+            assert data["model_loaded"] is False
+
+    def test_health_endpoint_with_model(self, mock_model, monkeypatch):
+        """/health returns loaded when model is set."""
+        from fastapi.testclient import TestClient
+        from selfllm.serving.server import app
+        import selfllm.serving.server as server_module
+
+        monkeypatch.setattr(server_module, "_model", mock_model)
+
+        with TestClient(app) as client:
+            response = client.get("/health")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["status"] == "healthy"
+            assert data["model_loaded"] is True
+
+    def test_models_endpoint(self):
+        """/v1/models lists available models."""
+        from fastapi.testclient import TestClient
+        from selfllm.serving.server import app
+
+        with TestClient(app) as client:
+            response = client.get("/v1/models")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["object"] == "list"
+            assert len(data["data"]) == 1
+            assert data["data"][0]["id"] == "selfllm"
+
+    def test_stats_endpoint_no_scheduler(self):
+        """/v1/stats returns error when scheduler not initialized."""
+        from fastapi.testclient import TestClient
+        from selfllm.serving.server import app
+
+        with TestClient(app) as client:
+            response = client.get("/v1/stats")
+            assert response.status_code == 200
+            data = response.json()
+            assert "error" in data
+
+    def test_stats_endpoint_with_scheduler(self, scheduler, monkeypatch):
+        """/v1/stats returns scheduler stats when available."""
+        from fastapi.testclient import TestClient
+        from selfllm.serving.server import app
+        import selfllm.serving.server as server_module
+
+        monkeypatch.setattr(server_module, "_scheduler", scheduler)
+
+        with TestClient(app) as client:
+            response = client.get("/v1/stats")
+            assert response.status_code == 200
+            data = response.json()
+            assert "active" in data
+            assert "waiting" in data
+            assert "free_blocks" in data
+
+    def test_chat_completions_no_model(self):
+        """/v1/chat/completions returns 503 when model not loaded."""
+        from fastapi.testclient import TestClient
+        from selfllm.serving.server import app
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "selfllm",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+            assert response.status_code == 503
+            assert "Model not loaded" in response.json()["detail"]
+
+    def test_chat_completions_with_model(self, mock_model, monkeypatch):
+        """/v1/chat/completions returns valid response."""
+        from fastapi.testclient import TestClient
+        from selfllm.serving.server import app
+        import selfllm.serving.server as server_module
+
+        # Build a decode result where slicing off the prompt leaves the response
+        prompt_text = "User: Hello\nAssistant:"
+        full_text = prompt_text + " hello world"
+
+        mock_tok = MagicMock()
+        mock_tok.eos_token_id = 1
+        mock_tok.encode = MagicMock(return_value=[10, 20, 30])
+        mock_tok.decode = MagicMock(return_value=full_text)
+
+        monkeypatch.setattr(server_module, "_model", mock_model)
+        monkeypatch.setattr(server_module, "_tokenizer", mock_tok)
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "selfllm",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 10,
+                },
+            )
+            assert response.status_code == 200
+            data = response.json()
+            assert data["object"] == "chat.completion"
+            assert data["model"] == "selfllm"
+            assert len(data["choices"]) == 1
+            assert data["choices"][0]["message"]["role"] == "assistant"
+            assert "hello" in data["choices"][0]["message"]["content"]
+            assert "usage" in data
+            assert "prompt_tokens" in data["usage"]
+            assert "completion_tokens" in data["usage"]
+
+    def test_completions_no_model(self):
+        """/v1/completions returns 503 when model not loaded."""
+        from fastapi.testclient import TestClient
+        from selfllm.serving.server import app
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/completions",
+                json={"model": "selfllm", "prompt": "Hello"},
+            )
+            assert response.status_code == 503
+
+    def test_completions_with_model(self, mock_model, monkeypatch):
+        """/v1/completions returns valid response."""
+        from fastapi.testclient import TestClient
+        from selfllm.serving.server import app
+        import selfllm.serving.server as server_module
+
+        mock_tok = MagicMock()
+        mock_tok.eos_token_id = 1
+        mock_tok.encode = MagicMock(return_value=[10, 20, 30])
+        mock_tok.decode = MagicMock(return_value="Hello world result")
+
+        monkeypatch.setattr(server_module, "_model", mock_model)
+        monkeypatch.setattr(server_module, "_tokenizer", mock_tok)
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/completions",
+                json={"model": "selfllm", "prompt": "Hello", "max_tokens": 10},
+            )
+            assert response.status_code == 200
+            data = response.json()
+            assert data["object"] == "text_completion"
+            assert "choices" in data
+            assert len(data["choices"]) == 1
+            assert "usage" in data
+
+    def test_chat_completions_validation(self, mock_model, monkeypatch):
+        """/v1/chat/completions validates request parameters."""
+        from fastapi.testclient import TestClient
+        from selfllm.serving.server import app
+        import selfllm.serving.server as server_module
+
+        monkeypatch.setattr(server_module, "_model", mock_model)
+        monkeypatch.setattr(server_module, "_tokenizer", MagicMock(
+            eos_token_id=1,
+            encode=MagicMock(return_value=[10, 20]),
+            decode=MagicMock(return_value="test"),
+        ))
+
+        with TestClient(app) as client:
+            # max_tokens must be >= 1
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "selfllm",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 0,
+                },
+            )
+            assert response.status_code == 422  # Validation error
+
+            # temperature must be >= 0
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "selfllm",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "temperature": -1.0,
+                },
+            )
+            assert response.status_code == 422  # Validation error
+
+    def test_streaming_chat_completions(self, mock_model, monkeypatch):
+        """/v1/chat/completions with stream=True returns SSE."""
+        from fastapi.testclient import TestClient
+        from selfllm.serving.server import app
+        import selfllm.serving.server as server_module
+
+        mock_tok = MagicMock()
+        mock_tok.eos_token_id = 1
+        mock_tok.encode = MagicMock(return_value=[10, 20])
+        mock_tok.decode = MagicMock(return_value="t")
+
+        monkeypatch.setattr(server_module, "_model", mock_model)
+        monkeypatch.setattr(server_module, "_tokenizer", mock_tok)
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "selfllm",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 1,
+                    "stream": True,
+                },
+            )
+            assert response.status_code == 200
+            assert response.headers["content-type"] == "text/event-stream; charset=utf-8"
+
+            content = response.content.decode()
+            assert "data:" in content
+            assert "[DONE]" in content
+
+
+# ---------------------------------------------------------------------------
+# End-to-end integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestEndToEnd:
+    """End-to-end integration tests for the full serving pipeline."""
+
+    def test_full_request_lifecycle(self, scheduler):
+        """Full lifecycle: waiting -> running -> finished."""
+        req = scheduler.create_request(
+            prompt_tokens=[1, 2, 3], max_new_tokens=2
+        )
+        assert req.status == "waiting"
+
+        # First step: waiting -> running
+        scheduler.step()
+        assert req.status == "running"
+        assert len(req.block_ids) > 0  # Blocks allocated
+
+        # Second step: still running
+        scheduler.step()
+        assert len(req.generated_tokens) == 2
+
+        # Third step: finished (max length reached)
+        completed = scheduler.step()
+        assert req.status == "finished"
+        assert req.is_finished
+        assert req.finished_at is not None
+        assert req.finish_reason == "length"
+
+    def test_multiple_requests_interleaved(self, scheduler):
+        """Multiple requests are processed concurrently."""
+        req1 = scheduler.create_request(prompt_tokens=[1, 2], max_new_tokens=2)
+        req2 = scheduler.create_request(prompt_tokens=[3, 4, 5], max_new_tokens=2)
+
+        # Both should be moved to active
+        scheduler.step()
+        assert scheduler.stats["active"] == 2
+
+        # Continue until completion
+        for _ in range(5):
+            scheduler.step()
+            if scheduler.stats["completed"] == 2:
+                break
+
+        assert scheduler.stats["completed"] == 2
+        assert len(req1.generated_tokens) == 2
+        assert len(req2.generated_tokens) == 2
+
+    def test_blocks_freed_on_completion(self, scheduler):
+        """Blocks are freed when a request completes."""
+        initial_free = scheduler.block_manager.num_free_blocks
+
+        req = scheduler.create_request(prompt_tokens=[1, 2, 3], max_new_tokens=1)
+        scheduler.step()  # Completes, frees blocks
+
+        # All blocks should be returned
+        assert scheduler.block_manager.num_free_blocks == initial_free
+
+    def test_request_with_zero_temperature(self, scheduler, mock_model):
+        """Request with temperature=0 triggers greedy decoding path."""
+        mock_model.generate.return_value = {
+            "sequences": torch.tensor([[42, 77]]),
+        }
+        req = scheduler.create_request(
+            prompt_tokens=[1, 2, 3], max_new_tokens=1, temperature=0.0
+        )
+        scheduler.step()
+        assert req.is_finished
+
+    def test_request_ordering(self, scheduler):
+        """Requests are processed in FIFO order."""
+        req1 = scheduler.create_request(prompt_tokens=[1], max_new_tokens=1)
+        req2 = scheduler.create_request(prompt_tokens=[2], max_new_tokens=1)
+        req3 = scheduler.create_request(prompt_tokens=[3], max_new_tokens=1)
+
+        # All should be completed
+        for _ in range(5):
+            scheduler.step()
+            if scheduler.stats["completed"] == 3:
+                break
+
+        # Check completion order
+        assert scheduler.completed_requests[0].id == req1.id
+        assert scheduler.completed_requests[1].id == req2.id
+        assert scheduler.completed_requests[2].id == req3.id

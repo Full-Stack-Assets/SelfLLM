@@ -1,0 +1,60 @@
+# Default configuration for SelfLLM
+# Override via CLI: --config custom.yaml, or pass individual flags.
+
+model:
+  vocab_size: 32000
+  d_model: 512
+  n_layers: 8
+  n_heads: 8
+  d_ff: 2048
+  max_seq_len: 512
+  dropout: 0.1
+  tie_weights: true
+  use_rope: true
+  use_swiglu: true
+  norm_eps: 1.0e-6
+  grad_checkpoint: false
+
+training:
+  batch_size: 16
+  learning_rate: 5.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
+  num_epochs: 10
+  gradient_accumulation_steps: 4
+
+recursive:
+  samples_per_iteration: 2000
+  responses_per_prompt: 3
+  generation_temperature: 0.8
+  generation_top_p: 0.92
+  generation_max_tokens: 256
+  keep_ratio: 0.4
+  training_epochs: 2
+  learning_rate: 5.0e-5
+  batch_size: 16
+  gradient_accumulation_steps: 4
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  max_iterations: 10
+  patience: 3
+  target_improvement: 0.01
+  replay_buffer_size: 10000
+  replay_ratio: 0.3
+  min_quality_score: 0.6
+  max_perplexity: 80.0
+  min_diversity: 0.35
+  rollback_on_degradation: true
+  save_every: 1
+  keep_last_n: 5
+
+generation:
+  temperature: 0.8
+  top_p: 0.92
+  top_k: 50
+  max_new_tokens: 256
+
+checkpoint_dir: "./checkpoints"
+seed: 42

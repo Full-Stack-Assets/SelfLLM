@@ -1,0 +1,414 @@
+"""OpenAI-compatible API server for SelfLLM.
+
+Provides FastAPI endpoints implementing the OpenAI API protocol:
+    POST /v1/chat/completions   -- Chat completions (with streaming support)
+    POST /v1/completions        -- Text completions
+    GET  /v1/models             -- List available models
+    GET  /health                -- Health check
+    GET  /v1/stats              -- Serving statistics
+
+The server integrates with PagedAttention KV cache and continuous batching
+for efficient concurrent request handling.
+"""
+
+import json
+import logging
+import time
+import uuid
+from contextlib import asynccontextmanager
+from typing import Any, AsyncGenerator, Dict, List, Optional
+
+import torch
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+
+# --- Pydantic Models ---
+
+
+class ChatMessage(BaseModel):
+    """A single message in a chat conversation."""
+
+    role: str
+    content: str
+
+
+class ChatCompletionRequest(BaseModel):
+    """Request body for /v1/chat/completions endpoint."""
+
+    model: str = "selfllm"
+    messages: List[ChatMessage]
+    max_tokens: int = Field(default=256, ge=1, le=4096)
+    temperature: float = Field(default=1.0, ge=0.0, le=2.0)
+    top_p: float = Field(default=1.0, ge=0.0, le=1.0)
+    stream: bool = False
+    stop: Optional[List[str]] = None
+
+
+class ChatCompletionResponse(BaseModel):
+    """Response body for /v1/chat/completions endpoint."""
+
+    id: str
+    object: str = "chat.completion"
+    created: int
+    model: str
+    choices: List[Dict[str, Any]]
+    usage: Dict[str, int]
+
+
+class CompletionRequest(BaseModel):
+    """Request body for /v1/completions endpoint."""
+
+    model: str = "selfllm"
+    prompt: str
+    max_tokens: int = Field(default=256, ge=1, le=4096)
+    temperature: float = Field(default=1.0, ge=0.0, le=2.0)
+    top_p: float = Field(default=1.0, ge=0.0, le=1.0)
+    stream: bool = False
+
+
+class ModelInfo(BaseModel):
+    """Information about a single model."""
+
+    id: str
+    object: str = "model"
+    created: int
+    owned_by: str = "selfllm"
+
+
+# --- Global State ---
+
+_model: Optional[torch.nn.Module] = None
+_tokenizer: Optional[Any] = None
+_scheduler: Optional[Any] = None
+
+# --- FastAPI App ---
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown events for the FastAPI application."""
+    logger.info("SelfLLM API server starting...")
+    yield
+    if _scheduler is not None:
+        _scheduler.shutdown()
+    logger.info("SelfLLM API server stopped.")
+
+
+app = FastAPI(title="SelfLLM API", version="2.0.0", lifespan=lifespan)
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: ChatCompletionRequest):
+    """OpenAI-compatible chat completions endpoint.
+
+    Supports both streaming (SSE) and non-streaming responses.
+
+    Args:
+        request: ChatCompletionRequest with messages and generation params.
+
+    Returns:
+        ChatCompletionResponse for non-streaming, or StreamingResponse
+        for streaming (SSE).
+
+    Raises:
+        HTTPException: 503 if model is not loaded.
+    """
+    if _model is None or _tokenizer is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    # Convert messages to prompt string
+    prompt = _messages_to_prompt(request.messages)
+    prompt_tokens = _tokenizer.encode(prompt)
+
+    if request.stream:
+        return StreamingResponse(
+            _stream_generate(prompt_tokens, request),
+            media_type="text/event-stream",
+        )
+
+    # Non-streaming: generate all at once
+    req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    device = next(_model.parameters()).device
+
+    input_ids = torch.tensor([prompt_tokens], device=device)
+    with torch.no_grad():
+        output = _model.generate(
+            input_ids,
+            max_new_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            stop_token_id=_tokenizer.eos_token_id,
+        )
+
+    all_token_ids = output["sequences"][0].tolist()
+    generated_text = _tokenizer.decode(all_token_ids)
+    response_text = generated_text[len(prompt) :]
+
+    completion_tokens = len(output["sequences"][0]) - len(prompt_tokens)
+
+    return ChatCompletionResponse(
+        id=req_id,
+        created=int(time.time()),
+        model=request.model,
+        choices=[
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": response_text},
+                "finish_reason": "stop",
+            }
+        ],
+        usage={
+            "prompt_tokens": len(prompt_tokens),
+            "completion_tokens": completion_tokens,
+            "total_tokens": len(prompt_tokens) + completion_tokens,
+        },
+    )
+
+
+@app.post("/v1/completions")
+async def completions(request: CompletionRequest):
+    """Text completions endpoint.
+
+    Args:
+        request: CompletionRequest with prompt and generation params.
+
+    Returns:
+        JSON response with generated text and usage statistics.
+
+    Raises:
+        HTTPException: 503 if model is not loaded.
+    """
+    if _model is None or _tokenizer is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    prompt_tokens = _tokenizer.encode(request.prompt)
+    device = next(_model.parameters()).device
+
+    input_ids = torch.tensor([prompt_tokens], device=device)
+    with torch.no_grad():
+        output = _model.generate(
+            input_ids,
+            max_new_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            stop_token_id=_tokenizer.eos_token_id,
+        )
+
+    all_token_ids = output["sequences"][0].tolist()
+    generated_text = _tokenizer.decode(all_token_ids)
+    response_text = generated_text[len(request.prompt) :]
+
+    return {
+        "id": f"cmpl-{uuid.uuid4().hex[:12]}",
+        "object": "text_completion",
+        "created": int(time.time()),
+        "model": request.model,
+        "choices": [
+            {"text": response_text, "index": 0, "finish_reason": "stop"}
+        ],
+        "usage": {
+            "prompt_tokens": len(prompt_tokens),
+            "completion_tokens": len(output["sequences"][0]) - len(prompt_tokens),
+            "total_tokens": len(output["sequences"][0]),
+        },
+    }
+
+
+@app.get("/v1/models")
+async def list_models():
+    """List available models.
+
+    Returns:
+        Object list with model metadata.
+    """
+    return {
+        "object": "list",
+        "data": [
+            ModelInfo(
+                id="selfllm", created=int(time.time())
+            ).model_dump()
+        ],
+    }
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint.
+
+    Returns:
+        Status information including model and scheduler state.
+    """
+    return {
+        "status": "healthy",
+        "model_loaded": _model is not None,
+        "scheduler_active": _scheduler is not None,
+    }
+
+
+@app.get("/v1/stats")
+async def stats():
+    """Serving statistics endpoint.
+
+    Returns:
+        Scheduler statistics if available.
+    """
+    if _scheduler is not None:
+        return _scheduler.stats
+    return {"error": "Scheduler not initialized"}
+
+
+# --- Helpers ---
+
+
+def _messages_to_prompt(messages: List[ChatMessage]) -> str:
+    """Convert chat messages to a single prompt string.
+
+    Formats messages as:
+        System: {content}
+        User: {content}
+        Assistant: {content}
+        Assistant:
+
+    Args:
+        messages: List of chat messages.
+
+    Returns:
+        Formatted prompt string ending with "Assistant:".
+    """
+    parts = []
+    for msg in messages:
+        if msg.role == "system":
+            parts.append(f"System: {msg.content}\n")
+        elif msg.role == "user":
+            parts.append(f"User: {msg.content}\n")
+        elif msg.role == "assistant":
+            parts.append(f"Assistant: {msg.content}\n")
+    parts.append("Assistant:")
+    return "".join(parts)
+
+
+async def _stream_generate(
+    prompt_tokens: List[int],
+    request: ChatCompletionRequest,
+) -> AsyncGenerator[str, None]:
+    """Stream generation results via Server-Sent Events.
+
+    Generates one token at a time and yields SSE data events.
+
+    Args:
+        prompt_tokens: Encoded prompt token IDs.
+        request: Generation parameters.
+
+    Yields:
+        SSE-formatted strings with generated token content.
+    """
+    device = next(_model.parameters()).device
+
+    input_ids = torch.tensor([prompt_tokens], device=device)
+
+    for _ in range(request.max_tokens):
+        with torch.no_grad():
+            output = _model.generate(
+                input_ids,
+                max_new_tokens=1,
+                temperature=request.temperature,
+                top_p=request.top_p,
+            )
+
+        token_id = output["sequences"][0, -1].item()
+
+        if token_id == _tokenizer.eos_token_id:
+            break
+
+        text = _tokenizer.decode([token_id])
+        yield f"data: {json.dumps({'choices': [{'delta': {'content': text}}]})}\n\n"
+        input_ids = torch.tensor([[token_id]], device=device)
+
+    yield "data: [DONE]\n\n"
+
+
+def serve(
+    model_path: str,
+    tokenizer_path: str,
+    host: str = "0.0.0.0",
+    port: int = 8000,
+    max_batch_size: int = 32,
+) -> None:
+    """Launch the API server with PagedAttention backend.
+
+    Loads the model and tokenizer, sets up the PagedAttention block manager
+    and continuous batching scheduler, then starts the uvicorn server.
+
+    Args:
+        model_path: Path to the model checkpoint directory.
+        tokenizer_path: Path to the tokenizer file.
+        host: Host address to bind to.
+        port: Port to listen on.
+        max_batch_size: Maximum concurrent requests in the scheduler.
+    """
+    import uvicorn
+
+    global _model, _tokenizer, _scheduler
+
+    from selfllm.model.model import SelfImprovingLLM
+    from selfllm.model.tokenizer import BPETokenizer
+    from selfllm.serving.paged_cache import BlockManager
+    from selfllm.serving.scheduler import ContinuousBatchingScheduler
+
+    # Load tokenizer
+    _tokenizer = BPETokenizer(vocab_size=32000)
+    _tokenizer.load(tokenizer_path)
+
+    # Load model
+    _model = SelfImprovingLLM.from_pretrained(model_path)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    _model = _model.to(device).eval()
+
+    # Setup PagedAttention block manager
+    config = _model.config
+    block_size = 16
+    num_blocks = 1000  # Configure based on GPU memory
+    block_manager = BlockManager(
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_layers=config.n_layers,
+        num_heads=config.n_heads,
+        head_dim=config.d_model // config.n_heads,
+        device=device,
+    )
+
+    # Setup continuous batching scheduler
+    _scheduler = ContinuousBatchingScheduler(
+        model=_model,
+        tokenizer=_tokenizer,
+        block_manager=block_manager,
+        max_batch_size=max_batch_size,
+        device=device,
+    )
+
+    param_count = sum(p.numel() for p in _model.parameters()) / 1e6
+    logger.info(f"Server ready on {host}:{port}")
+    logger.info(f"Model: {param_count:.1f}M params")
+    logger.info(f"Device: {device}")
+    logger.info(f"Max batch size: {max_batch_size}")
+
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="SelfLLM API Server")
+    parser.add_argument("--model-path", required=True, help="Path to model checkpoint")
+    parser.add_argument("--tokenizer-path", required=True, help="Path to tokenizer")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
+    parser.add_argument(
+        "--max-batch-size", type=int, default=32, help="Maximum batch size"
+    )
+    args = parser.parse_args()
+
+    serve(args.model_path, args.tokenizer_path, args.host, args.port, args.max_batch_size)
