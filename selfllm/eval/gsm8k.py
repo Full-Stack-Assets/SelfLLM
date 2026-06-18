@@ -184,6 +184,7 @@ class GSM8KBenchmark(Benchmark):
         top_p: float = 1.0,
         top_k: int = 0,
         limit: Optional[int] = None,
+        strategy: Optional[Any] = None,
         **kwargs: Any,
     ) -> EvalResult:
         """Run GSM8K and return exact-match accuracy.
@@ -196,6 +197,10 @@ class GSM8KBenchmark(Benchmark):
             top_p: Nucleus sampling threshold.
             top_k: Top-k cutoff (``0`` = disabled).
             limit: Optional cap on the number of examples evaluated.
+            strategy: Optional reasoning strategy (duck-typed: must expose
+                ``solve(prompt) -> result`` with a ``.answer`` attribute). When
+                given, it replaces the single greedy decode + extraction so the
+                benchmark measures the strategy's accuracy.
 
         Returns:
             An :class:`EvalResult` with exact-match accuracy as ``score`` and
@@ -210,20 +215,25 @@ class GSM8KBenchmark(Benchmark):
 
         for ex in examples:
             prompt = build_gsm8k_prompt(ex)
-            input_ids = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long)
-            out = model.generate(
-                input_ids,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                stop_token_id=tokenizer.eos_token_id,
-            )
-            seq = out["sequences"][0].tolist()
-            gen_ids = seq[input_ids.shape[1]:]
-            gen_text = tokenizer.decode(gen_ids)
+            if strategy is not None:
+                result = strategy.solve(prompt)
+                pred = result.answer
+                gen_text = result.traces[0] if result.traces else ""
+            else:
+                input_ids = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long)
+                out = model.generate(
+                    input_ids,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    stop_token_id=tokenizer.eos_token_id,
+                )
+                seq = out["sequences"][0].tolist()
+                gen_ids = seq[input_ids.shape[1]:]
+                gen_text = tokenizer.decode(gen_ids)
+                pred = extract_final_number(gen_text)
 
-            pred = extract_final_number(gen_text)
             gold = ex.gold_answer
             is_correct = pred is not None and gold is not None and pred == gold
             correct += int(is_correct)

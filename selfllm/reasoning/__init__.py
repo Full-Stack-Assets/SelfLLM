@@ -15,6 +15,7 @@ from .base import ReasoningResult, ReasoningStrategy
 from .beam_search import BeamSearchReasoner
 from .best_of_n import BestOfNStrategy
 from .cot import CoTStrategy, sample_cot_traces
+from .eval_integration import compare_strategies, format_lift_report, measure_lift
 from .extract import extract_answer, extract_tagged_answer, normalize
 from .self_consistency import SelfConsistencyStrategy
 from .verifier import Candidate, QualityVerifier, SelfConsistencyVerifier, Verifier
@@ -31,6 +32,9 @@ __all__ = [
     "Candidate",
     "SelfConsistencyVerifier",
     "QualityVerifier",
+    "measure_lift",
+    "compare_strategies",
+    "format_lift_report",
     "extract_answer",
     "extract_tagged_answer",
     "normalize",
