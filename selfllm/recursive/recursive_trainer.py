@@ -108,6 +108,9 @@ class RecursiveSelfTrainer:
         self.best_metrics: Optional[Dict[str, float]] = None
         self.best_checkpoint_path: Optional[str] = None
         self.metrics_history: List[Dict[str, float]] = []
+        # Persistent reward model (lazily created by _run_reward_model_step when
+        # use_reward_model is enabled), kept across iterations.
+        self.reward_trainer: Optional[Any] = None
 
         # Ensure checkpoint directory exists
         os.makedirs(self.config.checkpoint_dir, exist_ok=True)
@@ -340,6 +343,11 @@ class RecursiveSelfTrainer:
         ):
             benchmark_scores = self._run_benchmarks()
 
+        # Step 6c: optional reward-model update on self-critic preferences.
+        reward_scores: Dict[str, float] = {}
+        if getattr(self.config, "use_reward_model", False):
+            reward_scores = self._run_reward_model_step()
+
         iter_duration = time.time() - iter_start_time
 
         # Build and store metrics dict
@@ -358,8 +366,9 @@ class RecursiveSelfTrainer:
             "checkpoint_path": checkpoint_path,
             "duration_seconds": iter_duration,
         }
-        # Merge benchmark scores (benchmark_<name>) into the iteration record.
+        # Merge benchmark + reward scores into the iteration record.
         iteration_metrics.update(benchmark_scores)
+        iteration_metrics.update(reward_scores)
         self.metrics_history.append(iteration_metrics)
 
         # Save metrics to JSON
@@ -879,6 +888,60 @@ class RecursiveSelfTrainer:
         except Exception as e:  # pragma: no cover - defensive guard
             print(f"  ⚠️  Reasoning distillation failed "
                   f"({type(e).__name__}: {e}); continuing.")
+
+    def _run_reward_model_step(self) -> Dict[str, float]:
+        """Update a persistent reward model on self-critic preference pairs.
+
+        Builds preference pairs over the eval prompts (DPO self-critic ranking),
+        trains the reward model with the Bradley-Terry objective, and returns its
+        ranking accuracy/margin as ``reward_accuracy`` / ``reward_margin`` to
+        record in the metrics. The reward model persists across iterations on
+        ``self.reward_trainer`` so it improves alongside the policy. Guarded.
+        """
+        try:
+            import copy
+
+            from ..training.dpo_trainer import DPOTrainer
+            from ..training.ppo_trainer import RewardModel
+            from ..training.reward_trainer import RewardModelTrainer
+
+            print("[Step 6c] Updating reward model on self-critic preferences...")
+            # Lazily create the reward model (a copy of the current policy with a
+            # scalar head) and keep its trainer across iterations.
+            if getattr(self, "reward_trainer", None) is None:
+                reward_model = RewardModel(copy.deepcopy(self.model))
+                self.reward_trainer = RewardModelTrainer(
+                    reward_model, self.tokenizer,
+                    learning_rate=self.config.learning_rate,
+                    batch_size=self.config.batch_size, device=self.device,
+                )
+
+            pairs = DPOTrainer(
+                self.model, self.tokenizer, device=self.device
+            ).generate_preferences(
+                self.config.eval_prompts,
+                num_samples=self.config.reward_num_samples,
+                temperature=self.config.generation_temperature,
+                top_p=self.config.generation_top_p,
+            )
+            if not pairs:
+                print("  No preference pairs generated; skipping reward update.")
+                return {}
+
+            self.reward_trainer.train_step(
+                pairs, num_epochs=self.config.reward_model_epochs
+            )
+            metrics = self.reward_trainer.evaluate(pairs)
+            print(f"  Reward model: accuracy={metrics['accuracy']:.4f}, "
+                  f"margin={metrics['reward_margin']:.4f} ({len(pairs)} pairs)")
+            return {
+                "reward_accuracy": metrics["accuracy"],
+                "reward_margin": metrics["reward_margin"],
+            }
+        except Exception as e:  # pragma: no cover - defensive guard
+            print(f"  ⚠️  Reward-model step failed "
+                  f"({type(e).__name__}: {e}); continuing.")
+            return {}
 
     def _save_metrics_history(self) -> None:
         """Persist the full metrics history to JSON in the checkpoint dir."""

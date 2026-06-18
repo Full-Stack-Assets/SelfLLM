@@ -180,6 +180,42 @@ class TestRecursiveTrainer:
         # High-confidence traces were produced for both eval prompts -> training ran.
         assert not torch.equal(before, after)
 
+    def test_reward_model_step(
+        self,
+        model: SelfImprovingLLM,
+        tokenizer: BPETokenizer,
+        recursive_config: RecursiveConfig,
+        device: str,
+        monkeypatch,
+    ) -> None:
+        """The reward-model step trains a persistent reward model and records metrics."""
+        fixed_pairs = [
+            {"prompt": "Q1 ", "chosen": "good helpful correct",
+             "rejected": "bad wrong unhelpful"},
+            {"prompt": "Q2 ", "chosen": "the preferred answer here",
+             "rejected": "the worse answer here"},
+        ]
+        # Avoid real generation (deterministic + branch-independent).
+        monkeypatch.setattr(
+            "selfllm.training.dpo_trainer.DPOTrainer.generate_preferences",
+            lambda self, *a, **k: fixed_pairs,
+        )
+        recursive_config.use_reward_model = True
+        recursive_config.reward_model_epochs = 3
+        trainer = RecursiveSelfTrainer(
+            model.to(device), tokenizer, recursive_config, device=device
+        )
+        assert trainer.reward_trainer is None
+        scores = trainer._run_reward_model_step()
+
+        assert "reward_accuracy" in scores and "reward_margin" in scores
+        assert 0.0 <= scores["reward_accuracy"] <= 1.0
+        # Reward model persists across iterations (same object reused).
+        rt = trainer.reward_trainer
+        assert rt is not None
+        trainer._run_reward_model_step()
+        assert trainer.reward_trainer is rt
+
     # ------------------------------------------------------------------
     # 1. One iteration completes
     # ------------------------------------------------------------------
