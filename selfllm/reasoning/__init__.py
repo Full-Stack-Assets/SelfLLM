@@ -12,13 +12,25 @@ best-of-N with a verifier, and search.
 """
 
 from .base import ReasoningResult, ReasoningStrategy
-from .cot import CoTStrategy
+from .beam_search import BeamSearchReasoner
+from .best_of_n import BestOfNStrategy
+from .cot import CoTStrategy, sample_cot_traces
 from .extract import extract_answer, extract_tagged_answer, normalize
+from .self_consistency import SelfConsistencyStrategy
+from .verifier import Candidate, QualityVerifier, SelfConsistencyVerifier, Verifier
 
 __all__ = [
     "ReasoningResult",
     "ReasoningStrategy",
     "CoTStrategy",
+    "sample_cot_traces",
+    "SelfConsistencyStrategy",
+    "BestOfNStrategy",
+    "BeamSearchReasoner",
+    "Verifier",
+    "Candidate",
+    "SelfConsistencyVerifier",
+    "QualityVerifier",
     "extract_answer",
     "extract_tagged_answer",
     "normalize",

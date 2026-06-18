@@ -8,12 +8,43 @@ answer extractor.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, List
 
 from selfllm.cot.cot_generator import ChainOfThoughtGenerator
 
 from .base import ReasoningResult, ReasoningStrategy
 from .extract import extract_answer
+
+
+def sample_cot_traces(
+    generator: ChainOfThoughtGenerator,
+    question: str,
+    num_samples: int,
+    temperature: float = 0.8,
+    top_p: float = 0.9,
+    max_think_tokens: int = 256,
+    max_answer_tokens: int = 64,
+    vary_templates: bool = True,
+) -> List[dict]:
+    """Generate ``num_samples`` CoT trace dicts for ``question``.
+
+    Shared by the self-consistency and best-of-N strategies. When
+    ``vary_templates`` is set, each sample uses a different prompt template for
+    additional diversity on top of temperature sampling.
+    """
+    traces: List[dict] = []
+    for i in range(num_samples):
+        traces.append(
+            generator.generate_cot_response(
+                question,
+                template_idx=i if vary_templates else 0,
+                max_think_tokens=max_think_tokens,
+                max_answer_tokens=max_answer_tokens,
+                temperature=temperature,
+                top_p=top_p,
+            )
+        )
+    return traces
 
 
 class CoTStrategy(ReasoningStrategy):
