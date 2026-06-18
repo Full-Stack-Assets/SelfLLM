@@ -326,6 +326,15 @@ class RecursiveSelfTrainer:
             print(f"[Step 7/7] Degradation detected, rollback disabled or no best checkpoint.")
             checkpoint_path = self.best_checkpoint_path or ""
 
+        # Step 6b: optional eval-suite benchmark hook (MMLU/GSM8K/HumanEval).
+        # Runs on the model that is actually retained this iteration (post
+        # rollback decision) so the recorded scores match the kept checkpoint.
+        benchmark_scores: Dict[str, float] = {}
+        if getattr(self.config, "run_benchmarks", False) and (
+            self.iteration % max(1, getattr(self.config, "benchmark_every", 1)) == 0
+        ):
+            benchmark_scores = self._run_benchmarks()
+
         iter_duration = time.time() - iter_start_time
 
         # Build and store metrics dict
@@ -344,6 +353,8 @@ class RecursiveSelfTrainer:
             "checkpoint_path": checkpoint_path,
             "duration_seconds": iter_duration,
         }
+        # Merge benchmark scores (benchmark_<name>) into the iteration record.
+        iteration_metrics.update(benchmark_scores)
         self.metrics_history.append(iteration_metrics)
 
         # Save metrics to JSON
@@ -744,6 +755,52 @@ class RecursiveSelfTrainer:
             )
         except Exception as e:  # pragma: no cover - defensive guard
             print(f"  ⚠️  Constitutional step failed ({type(e).__name__}: {e}); continuing.")
+
+    def _run_benchmarks(self) -> Dict[str, float]:
+        """Run the configured eval-suite benchmarks on the current model.
+
+        Evaluates whichever of MMLU / GSM8K / HumanEval have a source set in the
+        config (``mmlu_source`` / ``gsm8k_source`` / ``humaneval_source``), each
+        capped at ``benchmark_limit`` examples for speed, and returns a flat
+        ``{"benchmark_<name>": score}`` dict to merge into the iteration metrics.
+
+        Guarded so any benchmark failure (or a missing eval package) degrades
+        gracefully and never aborts the recursive loop.
+        """
+        sources = {
+            "mmlu_source": getattr(self.config, "mmlu_source", None),
+            "gsm8k_source": getattr(self.config, "gsm8k_source", None),
+            "humaneval_source": getattr(self.config, "humaneval_source", None),
+        }
+        if not any(sources.values()):
+            return {}
+
+        scores: Dict[str, float] = {}
+        try:
+            from ..eval import run_all
+
+            print("[Step 6b] Running eval-suite benchmarks ...")
+            was_training = self.model.training
+            self.model.eval()
+            try:
+                results, _ = run_all(
+                    self.model,
+                    self.tokenizer,
+                    limit=getattr(self.config, "benchmark_limit", 20),
+                    max_new_tokens=getattr(self.config, "benchmark_max_new_tokens", 16),
+                    **sources,
+                )
+            finally:
+                if was_training:
+                    self.model.train()
+
+            for r in results:
+                scores[f"benchmark_{r.name}"] = float(r.score)
+                print(f"  {r.name}: {r.score:.4f} (n={r.n})")
+        except Exception as e:  # pragma: no cover - defensive guard
+            print(f"  ⚠️  Benchmark hook failed ({type(e).__name__}: {e}); skipping.")
+
+        return scores
 
     def _save_metrics_history(self) -> None:
         """Persist the full metrics history to JSON in the checkpoint dir."""
