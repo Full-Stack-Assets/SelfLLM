@@ -625,6 +625,54 @@ class TestServerEndpoints:
             )
             assert response.status_code == 422  # Validation error
 
+    def test_api_key_auth(self, monkeypatch):
+        """When an API key is configured, inference endpoints require Bearer auth."""
+        from fastapi.testclient import TestClient
+        import selfllm.serving.server as server_module
+
+        monkeypatch.setattr(server_module, "_api_key", "secret-key")
+        monkeypatch.setattr(server_module, "_model", None)
+        monkeypatch.setattr(server_module, "_tokenizer", None)
+        monkeypatch.setattr(server_module, "_scheduler", None)
+
+        body = {"model": "selfllm", "messages": [{"role": "user", "content": "hi"}]}
+        with TestClient(server_module.app) as client:
+            # No key -> 401
+            assert client.post("/v1/chat/completions", json=body).status_code == 401
+            # Wrong key -> 401
+            assert client.post(
+                "/v1/chat/completions", json=body,
+                headers={"Authorization": "Bearer nope"},
+            ).status_code == 401
+            # Correct key -> passes auth (503 because no model is loaded)
+            assert client.post(
+                "/v1/chat/completions", json=body,
+                headers={"Authorization": "Bearer secret-key"},
+            ).status_code == 503
+            # /v1/models is also protected
+            assert client.get("/v1/models").status_code == 401
+            assert client.get(
+                "/v1/models", headers={"Authorization": "Bearer secret-key"},
+            ).status_code == 200
+            # /health stays open
+            assert client.get("/health").status_code == 200
+
+    def test_no_api_key_is_open(self, monkeypatch):
+        """With no API key configured, endpoints are open (no auth required)."""
+        from fastapi.testclient import TestClient
+        import selfllm.serving.server as server_module
+
+        monkeypatch.setattr(server_module, "_api_key", None)
+        monkeypatch.setattr(server_module, "_model", None)
+        monkeypatch.setattr(server_module, "_tokenizer", None)
+        with TestClient(server_module.app) as client:
+            # No auth header, but unprotected -> reaches handler -> 503 (no model)
+            assert client.get("/v1/models").status_code == 200
+            assert client.post(
+                "/v1/chat/completions",
+                json={"model": "selfllm", "messages": [{"role": "user", "content": "hi"}]},
+            ).status_code == 503
+
     def test_chat_completions_reasoning_knob(self, monkeypatch):
         """/v1/chat/completions with a `reasoning` option runs a strategy."""
         from fastapi.testclient import TestClient

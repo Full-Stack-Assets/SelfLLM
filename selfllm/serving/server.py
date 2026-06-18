@@ -14,6 +14,7 @@ for efficient concurrent request handling.
 import asyncio
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -21,7 +22,7 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -89,6 +90,12 @@ _model: Optional[torch.nn.Module] = None
 _tokenizer: Optional[Any] = None
 _scheduler: Optional[Any] = None
 
+# Optional API key for the inference endpoints. When set (via the
+# SELFLLM_API_KEY env var or serve(api_key=...)), requests must send
+# `Authorization: Bearer <key>` -- this is what lets SelfLLM be registered as a
+# custom OpenAI-compatible provider. When unset, auth is disabled (open).
+_api_key: Optional[str] = os.environ.get("SELFLLM_API_KEY")
+
 # Safety cap: an endpoint never waits longer than this for a scheduled request
 # to finish, so a wedged/un-schedulable request cannot hang the connection.
 _REQUEST_TIMEOUT_S = 300.0
@@ -109,7 +116,25 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="SelfLLM API", version="2.0.0", lifespan=lifespan)
 
 
-@app.post("/v1/chat/completions")
+async def _check_api_key(authorization: Optional[str] = Header(None)) -> None:
+    """Bearer-token auth for the inference endpoints.
+
+    No-op when no API key is configured (open server). When a key is set,
+    requires ``Authorization: Bearer <key>`` and rejects anything else with 401
+    -- the standard scheme an OpenAI-compatible custom provider uses.
+    """
+    if _api_key is None:
+        return
+    expected = f"Bearer {_api_key}"
+    if authorization != expected:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+@app.post("/v1/chat/completions", dependencies=[Depends(_check_api_key)])
 async def chat_completions(request: ChatCompletionRequest):
     """OpenAI-compatible chat completions endpoint.
 
@@ -203,7 +228,7 @@ async def chat_completions(request: ChatCompletionRequest):
     )
 
 
-@app.post("/v1/completions")
+@app.post("/v1/completions", dependencies=[Depends(_check_api_key)])
 async def completions(request: CompletionRequest):
     """Text completions endpoint.
 
@@ -266,7 +291,7 @@ async def completions(request: CompletionRequest):
     }
 
 
-@app.get("/v1/models")
+@app.get("/v1/models", dependencies=[Depends(_check_api_key)])
 async def list_models():
     """List available models.
 
@@ -297,7 +322,7 @@ async def health():
     }
 
 
-@app.get("/v1/stats")
+@app.get("/v1/stats", dependencies=[Depends(_check_api_key)])
 async def stats():
     """Serving statistics endpoint.
 
@@ -534,6 +559,7 @@ def serve(
     num_blocks: Optional[int] = None,
     kv_cache_mem_gb: float = 4.0,
     compile_model: bool = False,
+    api_key: Optional[str] = None,
 ) -> None:
     """Launch the API server with PagedAttention backend.
 
@@ -556,7 +582,18 @@ def serve(
     """
     import uvicorn
 
-    global _model, _tokenizer, _scheduler
+    global _model, _tokenizer, _scheduler, _api_key
+
+    # Require a Bearer key on the inference endpoints when configured (arg wins
+    # over the SELFLLM_API_KEY env var). Needed to register SelfLLM as a
+    # custom provider.
+    if api_key is not None:
+        _api_key = api_key
+    if _api_key:
+        logger.info("API key auth ENABLED for /v1/* inference endpoints.")
+    else:
+        logger.warning("API key auth DISABLED (open server). Set SELFLLM_API_KEY "
+                       "or serve(api_key=...) before exposing publicly.")
 
     from selfllm.model.model import SelfImprovingLLM
     from selfllm.model.tokenizer import BPETokenizer
