@@ -702,20 +702,6 @@ def cmd_ppo(cfg: Dict[str, Any], logger: Logger) -> None:
     tokenizer = BPETokenizer(vocab_size=cfg["model"].get("vocab_size", 32000))
     tokenizer.load(tokenizer_path)
 
-    logger.warning(
-        "PPO is using a freshly-initialized RewardModel score head that has not "
-        "been trained. The reward signal is therefore not meaningful -- this "
-        "subcommand is a working scaffold for RLHF, not a useful reward model. "
-        "Train/load a real reward model before relying on PPO results."
-    )
-
-    trainer = PPOTrainer(
-        policy_model=model,
-        ref_model=copy.deepcopy(model),
-        reward_model=RewardModel(copy.deepcopy(model)),
-        device=cfg["device"],
-    )
-
     prompts = cfg.get("recursive", {}).get("eval_prompts") or [
         "The future of artificial intelligence is",
         "Once upon a time, in a distant land,",
@@ -724,6 +710,41 @@ def cmd_ppo(cfg: Dict[str, Any], logger: Logger) -> None:
     num_iterations = cfg.get("num_iterations")
     if num_iterations is None:
         num_iterations = 5
+
+    # Train the reward model on self-generated preference pairs so PPO optimizes
+    # a meaningful signal instead of a random head. Guarded: on failure we fall
+    # back to an untrained head (with a clear warning).
+    reward_model = RewardModel(copy.deepcopy(model))
+    try:
+        from selfllm.training.dpo_trainer import DPOTrainer
+        from selfllm.training.reward_trainer import RewardModelTrainer
+
+        logger.info("Generating preference pairs to train the reward model...")
+        pairs = DPOTrainer(model, tokenizer, device=cfg["device"]).generate_preferences(
+            prompts, num_samples=4
+        )
+        if pairs:
+            rm_trainer = RewardModelTrainer(reward_model, tokenizer, device=cfg["device"])
+            m = rm_trainer.train_step(pairs, num_epochs=3)
+            logger.info(
+                f"Reward model trained on {len(pairs)} pairs: "
+                f"loss={m['loss']:.4f}, accuracy={m['accuracy']:.4f}, "
+                f"margin={m['reward_margin']:.4f}"
+            )
+        else:
+            logger.warning("No preference pairs generated; reward head left untrained.")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"Reward-model training failed ({type(e).__name__}: {e}); "
+            f"PPO will run against an untrained reward head."
+        )
+
+    trainer = PPOTrainer(
+        policy_model=model,
+        ref_model=copy.deepcopy(model),
+        reward_model=reward_model,
+        device=cfg["device"],
+    )
 
     logger.info(f"Running {num_iterations} PPO iterations on {len(prompts)} prompts...")
     for it in range(num_iterations):
