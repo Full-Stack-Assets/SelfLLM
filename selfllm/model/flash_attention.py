@@ -160,7 +160,10 @@ class FlashAttention2(nn.Module):
 
         Args:
             x: Input tensor ``[batch, seq_len, d_model]``.
-            mask: Optional causal mask (unused, kept for API compatibility).
+            mask: Optional explicit attention mask (``True`` = masked out). When
+                provided (e.g. a non-causal mask for a vision encoder or a
+                block-wise multimodal mask), it is honoured via the manual
+                attention path; when ``None`` the fast causal kernel is used.
             kv_cache: Optional tuple of ``(cached_k, cached_v)`` for autoregressive
                 generation. Each has shape ``[batch, cache_len, n_heads, head_dim]``.
             is_prefill: ``True`` for full-sequence (prefill) mode,
@@ -201,8 +204,13 @@ class FlashAttention2(nn.Module):
             v = torch.cat([cached_v, v], dim=1)
         new_cache = (k, v)
 
-        # 5. Attention computation
-        if HAS_FLASH_ATTN and (q.dtype in (torch.float16, torch.bfloat16)):
+        # 5. Attention computation. The flash kernel only expresses causal /
+        # full attention, so an explicit custom mask routes to the manual path.
+        if (
+            mask is None
+            and HAS_FLASH_ATTN
+            and (q.dtype in (torch.float16, torch.bfloat16))
+        ):
             # Flash Attention 2 path (requires fp16/bf16)
             if kv_cache is not None and not is_prefill:
                 out = flash_attn_with_kvcache(
@@ -213,15 +221,15 @@ class FlashAttention2(nn.Module):
                     q, k, v, causal=True, softmax_scale=None,
                 )
         else:
-            # Fallback: manual scaled dot-product attention
-            if HAS_FLASH_ATTN and q.dtype == torch.float32:
+            # Fallback: manual scaled dot-product attention (honours `mask`).
+            if mask is None and HAS_FLASH_ATTN and q.dtype == torch.float32:
                 warnings.warn(
                     "Flash Attention 2 requires fp16/bf16; falling back to manual "
                     "attention. Consider using torch.autocast for mixed-precision "
                     "training/inference.",
                     stacklevel=2,
                 )
-            out = self._manual_attention(q, k, v, is_prefill)
+            out = self._manual_attention(q, k, v, is_prefill, mask=mask)
 
         # 6. Reshape and output projection
         out = out.reshape(batch, seq_len, self.d_model)
@@ -235,11 +243,14 @@ class FlashAttention2(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         is_prefill: bool,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Manual causal scaled dot-product attention (fallback).
+        """Manual scaled dot-product attention (fallback).
 
-        Operates on Flash Attention layout ``[B, T, H, D]``;
-        transposes internally to ``[B, H, T, D]`` for the matmuls.
+        Operates on Flash Attention layout ``[B, T, H, D]``; transposes
+        internally to ``[B, H, T, D]`` for the matmuls. When ``mask`` is given
+        (``True`` = masked out) it is applied verbatim; otherwise a standard
+        causal mask is used.
         """
         q_t = q.transpose(1, 2)  # [B, H, T_q, D]
         k_t = k.transpose(1, 2)  # [B, H, T_k, D]
@@ -249,7 +260,16 @@ class FlashAttention2(nn.Module):
 
         q_len = q_t.shape[2]
         kv_len = k_t.shape[2]
-        if is_prefill or q_len > 1:
+        if mask is not None:
+            # Broadcast the mask to [B, H, q_len, kv_len].
+            if mask.dim() == 2:
+                m = mask.unsqueeze(0).unsqueeze(0)
+            elif mask.dim() == 3:
+                m = mask.unsqueeze(1)
+            else:
+                m = mask
+            scores = scores.masked_fill(m, float("-inf"))
+        elif is_prefill or q_len > 1:
             causal_mask = torch.triu(
                 torch.ones(q_len, kv_len, device=q.device, dtype=torch.bool),
                 diagonal=1,
@@ -322,12 +342,54 @@ class HybridAttention(nn.Module):
         mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[Any] = None,
         is_prefill: bool = True,
+        use_cache: bool = False,
+        positions: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[Any]]:
-        """Forward pass -- delegates to the selected backend."""
-        if self.backend == "flash_attn":
-            return self.attn(x, mask=mask, kv_cache=kv_cache, is_prefill=is_prefill)
-        # Standard backend (RoPEMultiHeadAttention) does not accept is_prefill
-        return self.attn(x, mask=mask, kv_cache=kv_cache)
+        """Forward pass -- delegates to the selected backend.
+
+        Normalises the two backends' differing cache conventions so callers
+        get a single contract: when ``use_cache`` is ``True`` an updated KV
+        cache is always returned (and populated on prefill); when it is
+        ``False`` the returned cache is ``None``.
+
+        ``positions`` / ``key_padding_mask`` support batched continuous-batch
+        decoding and are only honoured by the standard backend (the batched
+        serving path runs on that backend).
+        """
+        if self.backend == "flash_attn" and key_padding_mask is None and positions is None:
+            # FlashAttention2 only populates a cache when one is passed in, so
+            # seed an empty cache on prefill to capture the prompt's K/V.
+            if use_cache and kv_cache is None:
+                batch = x.shape[0]
+                empty = x.new_zeros(batch, 0, self.n_heads, self.head_dim)
+                kv_cache = (empty, empty.clone())
+            if kv_cache is not None:
+                is_prefill = kv_cache[0].shape[1] == 0
+            out, new_cache = self.attn(
+                x, mask=mask, kv_cache=kv_cache, is_prefill=is_prefill
+            )
+        elif self.backend == "flash_attn":
+            # Batched decode with padding/positions: use the standard RoPE
+            # attention math against the flash module's projections is not
+            # supported, so fall back to the flash module's own path without
+            # the padding mask is unsafe -- instead require the standard
+            # backend for batched serving.
+            raise NotImplementedError(
+                "Batched continuous-batch decoding (positions/key_padding_mask) "
+                "requires the standard attention backend; flash_attn is not "
+                "supported for this path."
+            )
+        else:
+            # Standard backend (RoPEMultiHeadAttention).
+            out, new_cache = self.attn(
+                x,
+                mask=mask,
+                kv_cache=kv_cache,
+                positions=positions,
+                key_padding_mask=key_padding_mask,
+            )
+        return out, (new_cache if use_cache else None)
 
     @property
     def backend_name(self) -> str:

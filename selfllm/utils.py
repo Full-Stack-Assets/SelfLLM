@@ -49,10 +49,14 @@ def set_seed(seed: int) -> None:
 def get_device() -> str:
     """Return the best available compute device.
 
-    Returns ``'cuda'`` when a CUDA-capable GPU is available,
-    otherwise ``'cpu'``.
+    Prefers CUDA, then Apple Silicon (MPS), then CPU.
     """
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 # ---------------------------------------------------------------------------

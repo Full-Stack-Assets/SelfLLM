@@ -22,14 +22,26 @@ class Tool:
 
 
 class ToolRegistry:
-    """Registry of available tools."""
+    """Registry of available tools.
 
-    def __init__(self):
+    Safe-by-default: tools that can execute arbitrary code or touch the
+    filesystem/network (``python``, ``file_read``, ``file_write``, ``http_get``)
+    are NOT registered unless ``enable_unsafe_tools=True`` is passed explicitly.
+    This prevents the agent loop from autonomously running code, reading/writing
+    arbitrary files, or making outbound requests without an operator opting in.
+    """
+
+    # Tools that grant code execution, filesystem, or network access.
+    UNSAFE_TOOLS = ("python", "file_read", "file_write", "http_get")
+
+    def __init__(self, enable_unsafe_tools: bool = False):
         self._tools: Dict[str, Tool] = {}
+        self.enable_unsafe_tools = enable_unsafe_tools
         self._register_builtins()
 
     def _register_builtins(self):
-        """Register all built-in tools."""
+        """Register built-in tools (safe ones always; unsafe ones on opt-in)."""
+        # --- Safe tools (always available) ---
         self.register(
             Tool(
                 name="calculator",
@@ -45,70 +57,6 @@ class ToolRegistry:
                     "required": ["expression"],
                 },
                 function=self._calculator,
-            )
-        )
-
-        self.register(
-            Tool(
-                name="python",
-                description="Execute Python code in a sandboxed environment. Use for complex calculations, data processing, or algorithm implementation.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "code": {"type": "string", "description": "Python code to execute"}
-                    },
-                    "required": ["code"],
-                },
-                function=self._python,
-            )
-        )
-
-        self.register(
-            Tool(
-                name="file_read",
-                description="Read the contents of a file.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Path to the file"}
-                    },
-                    "required": ["path"],
-                },
-                function=self._file_read,
-            )
-        )
-
-        self.register(
-            Tool(
-                name="file_write",
-                description="Write content to a file.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Path to write"},
-                        "content": {
-                            "type": "string",
-                            "description": "Content to write",
-                        },
-                    },
-                    "required": ["path", "content"],
-                },
-                function=self._file_write,
-            )
-        )
-
-        self.register(
-            Tool(
-                name="http_get",
-                description="Fetch content from a URL via HTTP GET.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "url": {"type": "string", "description": "URL to fetch"}
-                    },
-                    "required": ["url"],
-                },
-                function=self._http_get,
             )
         )
 
@@ -151,6 +99,69 @@ class ToolRegistry:
             )
         )
 
+        # --- Unsafe tools (opt-in only) ---
+        if self.enable_unsafe_tools:
+            self.register(
+                Tool(
+                    name="python",
+                    description="Execute Python code. WARNING: not sandboxed -- only enable for trusted use.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "code": {"type": "string", "description": "Python code to execute"}
+                        },
+                        "required": ["code"],
+                    },
+                    function=self._python,
+                )
+            )
+            self.register(
+                Tool(
+                    name="file_read",
+                    description="Read the contents of a file.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Path to the file"}
+                        },
+                        "required": ["path"],
+                    },
+                    function=self._file_read,
+                )
+            )
+            self.register(
+                Tool(
+                    name="file_write",
+                    description="Write content to a file.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Path to write"},
+                            "content": {
+                                "type": "string",
+                                "description": "Content to write",
+                            },
+                        },
+                        "required": ["path", "content"],
+                    },
+                    function=self._file_write,
+                )
+            )
+            self.register(
+                Tool(
+                    name="http_get",
+                    description="Fetch content from a URL via HTTP GET.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string", "description": "URL to fetch"}
+                        },
+                        "required": ["url"],
+                    },
+                    function=self._http_get,
+                )
+            )
+
     def register(self, tool: Tool) -> None:
         """Register a tool."""
         self._tools[tool.name] = tool
@@ -188,38 +199,67 @@ class ToolRegistry:
 
     # --- Built-in tool implementations ---
 
-    @staticmethod
-    def _calculator(expression: str) -> str:
-        """Safely evaluate a mathematical expression."""
+    # Functions/constants the calculator is allowed to use.
+    _CALC_FUNCS = {
+        "abs": abs, "round": round, "max": max, "min": min, "sum": sum,
+        "pow": pow, "sqrt": math.sqrt, "sin": math.sin, "cos": math.cos,
+        "tan": math.tan, "log": math.log, "log10": math.log10, "exp": math.exp,
+        "floor": math.floor, "ceil": math.ceil,
+    }
+    _CALC_CONSTS = {"pi": math.pi, "e": math.e}
+
+    @classmethod
+    def _calculator(cls, expression: str) -> str:
+        """Safely evaluate a mathematical expression.
+
+        Uses a restricted AST walk instead of ``eval``. Only numeric literals,
+        arithmetic operators, and a whitelist of math functions/constants are
+        permitted. Attribute access, subscripting, names, comprehensions, etc.
+        are rejected, which closes the ``().__class__.__bases__`` style sandbox
+        escapes that a bare ``eval`` (even with empty builtins) allows.
+        """
         try:
-            # Whitelist of allowed names
-            allowed_names = {
-                "abs": abs,
-                "round": round,
-                "max": max,
-                "min": min,
-                "sum": sum,
-                "len": len,
-                "pow": pow,
-                "sqrt": math.sqrt,
-                "sin": math.sin,
-                "cos": math.cos,
-                "tan": math.tan,
-                "log": math.log,
-                "log10": math.log10,
-                "exp": math.exp,
-                "floor": math.floor,
-                "ceil": math.ceil,
-                "pi": math.pi,
-                "e": math.e,
-            }
-            # Parse and evaluate
             tree = ast.parse(expression.strip(), mode="eval")
-            code = compile(tree, "<string>", "eval")
-            result = eval(code, {"__builtins__": {}}, allowed_names)
-            return str(result)
+            return str(cls._eval_calc_node(tree.body))
         except Exception as e:
             return f"Error: {str(e)}"
+
+    @classmethod
+    def _eval_calc_node(cls, node: "ast.AST") -> Any:
+        """Recursively evaluate a whitelisted arithmetic AST node."""
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)):
+                return node.value
+            raise ValueError("only numeric literals are allowed")
+        if isinstance(node, ast.Name):
+            if node.id in cls._CALC_CONSTS:
+                return cls._CALC_CONSTS[node.id]
+            raise ValueError(f"unknown name: {node.id}")
+        if isinstance(node, ast.BinOp):
+            left = cls._eval_calc_node(node.left)
+            right = cls._eval_calc_node(node.right)
+            op = node.op
+            if isinstance(op, ast.Add): return left + right
+            if isinstance(op, ast.Sub): return left - right
+            if isinstance(op, ast.Mult): return left * right
+            if isinstance(op, ast.Div): return left / right
+            if isinstance(op, ast.FloorDiv): return left // right
+            if isinstance(op, ast.Mod): return left % right
+            if isinstance(op, ast.Pow): return left ** right
+            raise ValueError("unsupported operator")
+        if isinstance(node, ast.UnaryOp):
+            operand = cls._eval_calc_node(node.operand)
+            if isinstance(node.op, ast.UAdd): return +operand
+            if isinstance(node.op, ast.USub): return -operand
+            raise ValueError("unsupported unary operator")
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id not in cls._CALC_FUNCS:
+                raise ValueError("only whitelisted math functions are allowed")
+            if node.keywords:
+                raise ValueError("keyword arguments are not allowed")
+            args = [cls._eval_calc_node(a) for a in node.args]
+            return cls._CALC_FUNCS[node.func.id](*args)
+        raise ValueError(f"unsupported expression element: {type(node).__name__}")
 
     @staticmethod
     def _python(code: str) -> str:

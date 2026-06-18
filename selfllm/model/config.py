@@ -1,6 +1,7 @@
 """Model configuration dataclass for SelfLLM."""
 
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -20,6 +21,12 @@ class ModelConfig:
         use_swiglu: Use SwiGLU activation in FFN (default: True).
         norm_eps: Epsilon for numerical stability in layer norms (default: 1e-6).
         grad_checkpoint: Enable gradient checkpointing to save memory (default: False).
+        use_moe: Use Mixture of Experts instead of dense FFN (default: False).
+        moe_num_experts: Number of expert FFNs in MoE layers (default: 8).
+        moe_top_k: Number of experts each token routes to (default: 2).
+        moe_expert_d_ff: Hidden dim of each expert. None means d_model * 4 (default: None).
+        moe_capacity_factor: Max tokens per expert as fraction of average (default: 1.25).
+        moe_aux_loss_weight: Weight for the load-balancing auxiliary loss (default: 0.01).
     """
 
     vocab_size: int = 32000
@@ -34,3 +41,16 @@ class ModelConfig:
     use_swiglu: bool = True
     norm_eps: float = 1e-6
     grad_checkpoint: bool = False
+    use_moe: bool = False
+    moe_num_experts: int = 8
+    moe_top_k: int = 2
+    moe_expert_d_ff: Optional[int] = None
+    moe_capacity_factor: float = 1.25
+    moe_aux_loss_weight: float = 0.01
+
+    # Long-context attention. When ``sliding_window`` is set, each token attends
+    # only to the most recent ``sliding_window`` tokens, plus the first
+    # ``attention_sinks`` "sink" tokens -- breaking the quadratic full-context
+    # attention for long sequences.
+    sliding_window: Optional[int] = None
+    attention_sinks: int = 0

@@ -89,6 +89,12 @@ class TestCalculator:
         result = registry._calculator('__import__("os")')
         assert result.startswith("Error:")
 
+    def test_calculator_blocks_attribute_escape(self):
+        """The object-subclass sandbox escape must be rejected, not evaluated."""
+        registry = ToolRegistry()
+        result = registry._calculator("().__class__.__bases__[0].__subclasses__()")
+        assert result.startswith("Error:")
+
     def test_calculator_complex_expression(self):
         """Test complex nested expression."""
         registry = ToolRegistry()
@@ -304,19 +310,18 @@ class TestToolRegistry:
     """Tests for the ToolRegistry class."""
 
     def test_registry_default_tools(self):
-        """Test that default tools are registered."""
+        """Only safe tools are registered by default."""
         registry = ToolRegistry()
-        expected_tools = [
-            "calculator",
-            "python",
-            "file_read",
-            "file_write",
-            "http_get",
-            "search",
-            "current_time",
-            "count_words",
-        ]
-        for name in expected_tools:
+        for name in ["calculator", "search", "current_time", "count_words"]:
+            assert name in registry
+        # Code-execution / filesystem / network tools are disabled by default.
+        for name in ["python", "file_read", "file_write", "http_get"]:
+            assert name not in registry
+
+    def test_registry_unsafe_tools_opt_in(self):
+        """Unsafe tools are registered only when explicitly enabled."""
+        registry = ToolRegistry(enable_unsafe_tools=True)
+        for name in ["python", "file_read", "file_write", "http_get"]:
             assert name in registry
 
     def test_registry_get(self):
@@ -357,7 +362,7 @@ class TestToolRegistry:
         """Test listing tools returns correct structure."""
         registry = ToolRegistry()
         tools = registry.list_tools()
-        assert len(tools) == 8
+        assert len(tools) == 4  # safe tools only by default
         for tool in tools:
             assert "name" in tool
             assert "description" in tool
@@ -374,7 +379,8 @@ class TestToolRegistry:
     def test_registry_len(self):
         """Test __len__ returns correct count."""
         registry = ToolRegistry()
-        assert len(registry) == 8
+        assert len(registry) == 4  # safe tools only by default
+        assert len(ToolRegistry(enable_unsafe_tools=True)) == 8
 
     def test_registry_contains(self):
         """Test __contains__ works."""

@@ -468,11 +468,13 @@ class FSDPTrainer:
         """
         train_loader = self._get_dataloader(train_dataset, shuffle=True)
 
-        # Scheduler
-        total_steps = (
-            len(train_loader)
-            // self.gradient_accumulation_steps
-            * num_epochs
+        # Scheduler. Use ceil and a floor of 1 so the trailing accumulation
+        # window is counted and the horizon never collapses to 0 on tiny
+        # datasets (which would force the LR straight to its minimum).
+        total_steps = max(
+            1,
+            math.ceil(len(train_loader) / self.gradient_accumulation_steps)
+            * num_epochs,
         )
         warmup_steps = int(total_steps * self.warmup_ratio)
         scheduler = get_lr_scheduler(self.optimizer, warmup_steps, total_steps)
@@ -693,12 +695,23 @@ class FSDPTrainer:
                 f"(epoch {checkpoint.get('current_epoch', '?')}, "
                 f"step {checkpoint.get('global_step', '?')})"
             )
+            model_state = checkpoint.get("model_state_dict")
         else:
             checkpoint = {}
+            model_state = None
 
-        # Load model state -- FSDP handles the broadcast
-        if "model_state_dict" in checkpoint:
-            self.model.load_state_dict(checkpoint["model_state_dict"])
+        # Only rank 0 read the checkpoint from disk, so broadcast the full
+        # state dict to every rank. Loading a FULL_STATE_DICT requires *all*
+        # ranks to call load_state_dict together so FSDP can scatter the
+        # shards; skipping non-zero ranks leaves them with stale/random weights
+        # (and risks a collective hang).
+        if dist.is_initialized() and self.world_size > 1:
+            obj = [model_state]
+            dist.broadcast_object_list(obj, src=0)
+            model_state = obj[0]
+
+        if model_state is not None:
+            self.model.load_state_dict(model_state)
 
         # Optimiser and other state are only meaningful on rank 0
         if self.is_main_process:

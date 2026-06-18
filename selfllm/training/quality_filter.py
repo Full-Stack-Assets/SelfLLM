@@ -75,7 +75,7 @@ class QualityFilter:
             ids_tensor = torch.tensor([token_ids], device=self.device)
 
             with torch.no_grad():
-                outputs = self.base_model(ids_tensor)
+                outputs = self.base_model(token_ids=ids_tensor)
                 logits = outputs["logits"]
 
                 # Shift logits and targets for next-token prediction
@@ -334,8 +334,11 @@ class QualityFilter:
         # Sort by overall quality score (descending)
         filtered.sort(key=lambda x: x["quality_scores"]["overall"], reverse=True)
 
-        # Keep top keep_ratio
-        keep_count = max(1, int(len(samples) * keep_ratio))
+        # Keep the top keep_ratio fraction, but never exceed the number of
+        # samples that actually passed the hard thresholds -- the minimum-of-1
+        # must not fabricate a kept sample when nothing qualified.
+        target = max(1, int(len(samples) * keep_ratio))
+        keep_count = min(target, len(filtered))
         result = filtered[:keep_count]
 
         logger.info(f"Final kept: {len(result)} / {len(samples)}")

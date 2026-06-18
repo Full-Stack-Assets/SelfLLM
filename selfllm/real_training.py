@@ -218,14 +218,16 @@ def train_real_model(
     trainer = LLMTrainer(
         model=model,
         tokenizer=tokenizer,
+        # LLMTrainer reads flat config keys (config.get("learning_rate"), ...),
+        # so the hyperparameters must be passed at the top level -- a nested
+        # {"training": {...}} dict is silently ignored and every value falls
+        # back to its default (lr=5e-4, batch=16, ...).
         config={
-            "training": {
-                "batch_size": pretrain_batch_size,
-                "learning_rate": pretrain_lr,
-                "weight_decay": 0.01,
-                "warmup_ratio": 0.1,
-                "max_grad_norm": 1.0,
-            }
+            "batch_size": pretrain_batch_size,
+            "learning_rate": pretrain_lr,
+            "weight_decay": 0.01,
+            "warmup_ratio": 0.1,
+            "max_grad_norm": 1.0,
         },
         device=device,
     )
@@ -297,6 +299,7 @@ def train_real_model(
             eval_prompts=test_prompts,
             replay_buffer_size=2000,
             replay_ratio=0.3,
+            use_dpo=use_dpo,
         )
 
         recursive_trainer = RecursiveSelfTrainer(
@@ -327,6 +330,15 @@ def train_real_model(
     final_path = os.path.join(output_dir, "final")
     model.save_pretrained(final_path)
     print(f"\n[Step 9] Final model saved to {final_path}")
+
+    # When LoRA was used, also save just the adapter weights so the small
+    # adapter can be distributed/loaded separately from the full checkpoint.
+    if use_lora:
+        from selfllm.model.lora import save_lora_weights
+
+        lora_path = os.path.join(output_dir, "lora_adapter.pt")
+        save_lora_weights(model, lora_path)
+        print(f"  LoRA adapter saved to {lora_path}")
 
     # Save config
     config_path = os.path.join(output_dir, "config.json")

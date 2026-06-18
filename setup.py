@@ -18,6 +18,14 @@ setup(
     python_requires=">=3.9",
     packages=find_packages(),
     install_requires=install_requires,
+    extras_require={
+        # Vector retrieval for RAG / long-context memory.
+        "rag": ["faiss-cpu>=1.7.0"],
+        # Web dashboard.
+        "dashboard": ["gradio>=4.0.0"],
+        # Test suite.
+        "dev": ["pytest>=7.0.0"],
+    },
     include_package_data=True,
     package_data={
         "selfllm": ["config.yaml"],

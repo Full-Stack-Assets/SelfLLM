@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from .config import ModelConfig
 from .layers import RMSNorm, TransformerBlock
+from .moe import MoETransformerBlock
 
 
 def _create_causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
@@ -27,6 +28,45 @@ def _create_causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
         torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
         diagonal=1,
     )
+
+
+def _create_sliding_window_mask(
+    seq_len: int, device: torch.device, window: int, sinks: int = 0
+) -> torch.Tensor:
+    """Causal mask restricted to a sliding window plus optional attention sinks.
+
+    A query at position ``i`` attends to keys ``j`` where ``j <= i`` and
+    ``j > i - window``; additionally the first ``sinks`` tokens are always
+    attendable. Returns a boolean mask where ``True`` means "masked out".
+    """
+    i = torch.arange(seq_len, device=device).unsqueeze(1)  # [S, 1] query
+    j = torch.arange(seq_len, device=device).unsqueeze(0)  # [1, S] key
+    masked = (j > i) | (j <= i - window)
+    if sinks > 0:
+        keep_sink = (j < sinks) & (j <= i)  # sink tokens, still causal
+        masked = masked & ~keep_sink
+    return masked
+
+
+def _create_sliding_window_decode_mask(
+    seq_len: int, cache_len: int, device: torch.device, window: int, sinks: int = 0
+) -> torch.Tensor:
+    """Sliding-window + sink mask for cached decoding.
+
+    The ``seq_len`` new tokens sit at absolute positions ``cache_len ..
+    cache_len + seq_len - 1`` and attend over the full ``kv_len = cache_len +
+    seq_len`` keys. A query at absolute position ``p`` attends to keys ``q``
+    with ``q <= p`` and ``q > p - window``, plus the first ``sinks`` keys.
+    Returns a boolean ``[seq_len, kv_len]`` mask (``True`` = masked out).
+    """
+    kv_len = cache_len + seq_len
+    qpos = torch.arange(cache_len, kv_len, device=device).unsqueeze(1)  # [S, 1]
+    kpos = torch.arange(kv_len, device=device).unsqueeze(0)             # [1, kv_len]
+    masked = (kpos > qpos) | (kpos <= qpos - window)
+    if sinks > 0:
+        keep_sink = (kpos < sinks) & (kpos <= qpos)
+        masked = masked & ~keep_sink
+    return masked
 
 
 class SelfImprovingLLM(nn.Module):
@@ -48,10 +88,15 @@ class SelfImprovingLLM(nn.Module):
         # Token embeddings
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
 
-        # Transformer blocks
-        self.blocks = nn.ModuleList(
-            [TransformerBlock(config) for _ in range(config.n_layers)]
-        )
+        # Transformer blocks (MoE or dense)
+        if getattr(config, "use_moe", False):
+            self.blocks = nn.ModuleList(
+                [MoETransformerBlock(config) for _ in range(config.n_layers)]
+            )
+        else:
+            self.blocks = nn.ModuleList(
+                [TransformerBlock(config) for _ in range(config.n_layers)]
+            )
 
         # Final layer norm
         self.norm = RMSNorm(config.d_model, eps=config.norm_eps)
@@ -89,19 +134,33 @@ class SelfImprovingLLM(nn.Module):
         self,
         token_ids: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        positions: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
         """Forward pass through the model.
 
         Args:
             token_ids: Input token IDs ``[batch, seq_len]``.
             targets: Target token IDs for loss computation ``[batch, seq_len]``.
                      If provided, the loss is computed as cross-entropy.
+            past_key_values: Per-layer ``(k, v)`` caches from a previous call,
+                     used for incremental autoregressive decoding. When given,
+                     ``token_ids`` should contain only the new tokens.
+            use_cache: If ``True``, return the updated per-layer KV caches under
+                     the ``past_key_values`` key.
+            positions: Optional per-row absolute positions ``[batch, seq_len]``
+                     for batched continuous-batch decoding.
+            key_padding_mask: Optional cached-key validity mask ``[batch, cache_len]``
+                     for batched decoding over right-padded caches.
 
         Returns:
             Dictionary with keys:
                 - ``logits``: ``[batch, seq_len, vocab_size]``
                 - ``loss``: scalar cross-entropy loss (if ``targets`` provided)
                 - ``hidden_states``: ``[batch, seq_len, d_model]``
+                - ``past_key_values``: updated caches (if ``use_cache``)
         """
         batch, seq_len = token_ids.shape
         device = token_ids.device
@@ -110,12 +169,45 @@ class SelfImprovingLLM(nn.Module):
         x = self.token_embedding(token_ids)  # [B, T, D]
         x = self.dropout(x)
 
-        # Causal mask
-        mask = _create_causal_mask(seq_len, device)
+        # Build the attention mask. For the non-cached (prefill / full) path the
+        # attention layer would build a plain causal mask from ``mask=None``;
+        # we supply an explicit mask so sliding-window models stay windowed on
+        # *both* prefill and cached decode (otherwise decode would silently
+        # attend to the full unbounded history).
+        window = getattr(self.config, "sliding_window", None)
+        sinks = getattr(self.config, "attention_sinks", 0)
+        if past_key_values is not None:
+            if window and positions is None and key_padding_mask is None:
+                cache_len = past_key_values[0][0].shape[2]
+                mask = _create_sliding_window_decode_mask(
+                    seq_len, cache_len, device, window, sinks
+                )
+            else:
+                # Cached decode: attention builds the correct causal mask from
+                # the cache length (or batched serving supplies positions/mask).
+                mask = None
+        elif window:
+            mask = _create_sliding_window_mask(seq_len, device, window, sinks)
+        else:
+            mask = _create_causal_mask(seq_len, device)
 
         # Transformer blocks
-        for block in self.blocks:
-            if self.config.grad_checkpoint and self.training:
+        new_caches: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = (
+            [] if use_cache else None
+        )
+        for i, block in enumerate(self.blocks):
+            layer_past = past_key_values[i] if past_key_values is not None else None
+            if use_cache:
+                x, layer_cache = block(
+                    x,
+                    mask=mask,
+                    kv_cache=layer_past,
+                    use_cache=True,
+                    positions=positions,
+                    key_padding_mask=key_padding_mask,
+                )
+                new_caches.append(layer_cache)
+            elif self.config.grad_checkpoint and self.training:
                 x = torch.utils.checkpoint.checkpoint(block, x, mask)
             else:
                 x = block(x, mask=mask)
@@ -126,10 +218,13 @@ class SelfImprovingLLM(nn.Module):
         # LM head
         logits = self.lm_head(hidden_states)
 
-        result: Dict[str, torch.Tensor] = {
+        result: Dict[str, Any] = {
             "logits": logits,
             "hidden_states": hidden_states,
         }
+
+        if use_cache:
+            result["past_key_values"] = new_caches
 
         if targets is not None:
             loss = F.cross_entropy(
@@ -137,6 +232,15 @@ class SelfImprovingLLM(nn.Module):
                 targets.view(-1),
                 ignore_index=-100,
             )
+
+            # Add MoE load-balancing auxiliary loss
+            if getattr(self.config, "use_moe", False):
+                aux_loss = sum(
+                    block.aux_loss for block in self.blocks
+                    if hasattr(block, "aux_loss")
+                )
+                loss = loss + aux_loss * self.config.moe_aux_loss_weight
+
             result["loss"] = loss
 
         return result
@@ -194,18 +298,32 @@ class SelfImprovingLLM(nn.Module):
             for b in range(batch_size):
                 seen_tokens[b].scatter_(0, prompt_ids[b], 1.0)
 
+        # Incremental KV cache: prefill the prompt once, then feed a single
+        # token per step. This is O(n) over the generation instead of the
+        # O(n^2) full re-encode of the whole prefix each step.
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
+        next_token: Optional[torch.Tensor] = None
+        max_len = self.config.max_seq_len
+
+        # Per-sequence completion tracking so each row in the batch stops at its
+        # own stop token rather than waiting for every row to emit one.
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
         for step in range(max_new_tokens):
-            seq_len = generated.shape[1]
-
             # Prepare inputs
-            if seq_len > self.config.max_seq_len:
-                # Truncate to max sequence length
-                input_ids = generated[:, -self.config.max_seq_len :]
+            if past_key_values is None:
+                # Prefill: feed the prompt (truncated to the context window).
+                if generated.shape[1] > max_len:
+                    input_ids = generated[:, -max_len:]
+                else:
+                    input_ids = generated
             else:
-                input_ids = generated
+                # Decode: feed only the most recently sampled token.
+                input_ids = next_token
 
-            # Forward pass
-            out = self.forward(input_ids)
+            # Forward pass (with incremental KV cache)
+            out = self.forward(input_ids, past_key_values=past_key_values, use_cache=True)
+            past_key_values = out["past_key_values"]
             logits = out["logits"][:, -1, :]  # [batch, vocab_size] — last position
             hidden = out["hidden_states"][:, -1, :]  # [batch, d_model]
 
@@ -260,6 +378,14 @@ class SelfImprovingLLM(nn.Module):
                 batch_idx = torch.arange(batch_size, device=device)
                 scores.append(probs[batch_idx, next_token.squeeze(-1)])
 
+            # Sequences that already hit the stop token keep emitting it, so a
+            # finished row is not extended with fresh content while other rows
+            # continue generating.
+            if stop_token_id is not None:
+                next_token = next_token.masked_fill(
+                    finished.unsqueeze(-1), stop_token_id
+                )
+
             # Update seen tokens
             if seen_tokens is not None:
                 for b in range(batch_size):
@@ -268,9 +394,11 @@ class SelfImprovingLLM(nn.Module):
             # Append to generated sequence
             generated = torch.cat([generated, next_token], dim=1)
 
-            # Check for stop token
-            if stop_token_id is not None and (next_token == stop_token_id).all():
-                break
+            # Stop only once every sequence in the batch has emitted the stop token.
+            if stop_token_id is not None:
+                finished = finished | (next_token.squeeze(-1) == stop_token_id)
+                if bool(finished.all()):
+                    break
 
         result: Dict[str, torch.Tensor] = {
             "sequences": generated,

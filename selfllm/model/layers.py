@@ -1,6 +1,6 @@
 """Transformer layer components: RMSNorm, TransformerBlock, SwiGLU FFN."""
 
-from typing import Optional
+from typing import Any, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -129,21 +129,39 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        kv_cache: Optional[Any] = None,
+        use_cache: bool = False,
+        positions: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Any]]:
         """Forward pass through the transformer block.
 
         Args:
             x: Input tensor ``[batch, seq_len, d_model]``.
             mask: Optional causal mask tensor.
+            kv_cache: Optional key/value cache for incremental decoding.
+            use_cache: If ``True``, also return the updated KV cache.
+            positions: Optional per-row absolute positions for batched decode.
+            key_padding_mask: Optional cached-key validity mask for batched decode.
 
         Returns:
-            Output tensor ``[batch, seq_len, d_model]``.
+            Output tensor ``[batch, seq_len, d_model]``, or a
+            ``(output, kv_cache)`` tuple when ``use_cache`` is ``True``.
         """
         # Pre-norm attention with residual
-        attn_out, _ = self.attn(self.ln1(x), mask=mask)
+        attn_out, new_cache = self.attn(
+            self.ln1(x),
+            mask=mask,
+            kv_cache=kv_cache,
+            use_cache=use_cache,
+            positions=positions,
+            key_padding_mask=key_padding_mask,
+        )
         x = x + attn_out
 
         # Pre-norm FFN with residual
         x = x + self.ffn(self.ln2(x))
 
+        if use_cache:
+            return x, new_cache
         return x

@@ -2,6 +2,7 @@
 
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any, Dict, List
 from unittest.mock import MagicMock
 
@@ -12,6 +13,47 @@ from selfllm.serving.paged_cache import BlockManager
 from selfllm.serving.scheduler import ContinuousBatchingScheduler, Request
 
 
+class _StubModel:
+    """Minimal model exposing the ``forward(...)`` contract the scheduler needs.
+
+    Returns deterministic logits (peaked at ``force_token`` so greedy decoding
+    is predictable) and correctly-shaped KV caches, without a real transformer.
+    """
+
+    def __init__(self, vocab=64, n_layers=2, n_heads=2, head_dim=8, force_token=7):
+        self.vocab = vocab
+        self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.head_dim = head_dim
+        self.force_token = force_token
+        self.config = SimpleNamespace(
+            max_seq_len=128, vocab_size=vocab, n_layers=n_layers,
+            n_heads=n_heads, d_model=n_heads * head_dim,
+        )
+
+    def parameters(self):
+        yield torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, token_ids, past_key_values=None, use_cache=False,
+                positions=None, key_padding_mask=None, targets=None):
+        B, T = token_ids.shape
+        logits = torch.zeros(B, T, self.vocab)
+        if self.force_token is not None:
+            logits[:, :, self.force_token] = 10.0
+        result = {"logits": logits, "hidden_states": torch.zeros(B, T, self.config.d_model)}
+        if use_cache:
+            cl = past_key_values[0][0].shape[2] if past_key_values is not None else 0
+            nl = cl + T
+            result["past_key_values"] = [
+                (torch.zeros(B, self.n_heads, nl, self.head_dim),
+                 torch.zeros(B, self.n_heads, nl, self.head_dim))
+                for _ in range(self.n_layers)
+            ]
+        return result
+
+    __call__ = forward
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -19,7 +61,7 @@ from selfllm.serving.scheduler import ContinuousBatchingScheduler, Request
 
 @pytest.fixture
 def mock_model():
-    """Create a mock model with a generate() method."""
+    """Create a mock model with a generate() method (for server fallback path)."""
     model = MagicMock()
     model.generate.return_value = {
         "sequences": torch.tensor([[42, 99]]),  # 42 is prompt, 99 is generated
@@ -29,6 +71,12 @@ def mock_model():
     param.device = torch.device("cpu")
     model.parameters.return_value = iter([param])
     return model
+
+
+@pytest.fixture
+def stub_model():
+    """Deterministic stub model implementing forward() for scheduler tests."""
+    return _StubModel(force_token=7)
 
 
 @pytest.fixture
@@ -56,10 +104,10 @@ def block_manager():
 
 
 @pytest.fixture
-def scheduler(mock_model, mock_tokenizer, block_manager):
+def scheduler(stub_model, mock_tokenizer, block_manager):
     """Create a ContinuousBatchingScheduler for testing."""
     return ContinuousBatchingScheduler(
-        model=mock_model,
+        model=stub_model,
         tokenizer=mock_tokenizer,
         block_manager=block_manager,
         max_batch_size=4,
@@ -124,9 +172,9 @@ class TestRequest:
 class TestSchedulerInit:
     """Tests for ContinuousBatchingScheduler initialization."""
 
-    def test_scheduler_init(self, scheduler, mock_model, mock_tokenizer, block_manager):
+    def test_scheduler_init(self, scheduler, stub_model, mock_tokenizer, block_manager):
         """Scheduler initializes correctly."""
-        assert scheduler.model is mock_model
+        assert scheduler.model is stub_model
         assert scheduler.tokenizer is mock_tokenizer
         assert scheduler.block_manager is block_manager
         assert scheduler.max_batch_size == 4
@@ -174,21 +222,26 @@ class TestSchedulerStep:
         assert scheduler.stats["waiting"] == 0
         assert req.status == "running"
 
-    def test_step_generates_token(self, scheduler, mock_model):
+    def test_step_generates_token(self, scheduler):
         """step() generates a token for active requests."""
-        req = scheduler.create_request(prompt_tokens=[1, 2, 3], max_new_tokens=5)
-        scheduler.step()  # Move to active and generate first token
+        req = scheduler.create_request(
+            prompt_tokens=[1, 2, 3], max_new_tokens=5, temperature=0.0
+        )
+        scheduler.step()  # Move to active and prefill (first token)
 
-        mock_model.generate.assert_called()
         assert len(req.generated_tokens) == 1
-        assert req.generated_tokens[0] == 99  # From mock return value
+        # Greedy decoding against the stub picks force_token deterministically.
+        assert req.generated_tokens[0] == scheduler.model.force_token
 
     def test_step_completes_on_eos(self, scheduler, mock_tokenizer):
         """step() marks request finished on EOS token."""
-        mock_tokenizer.eos_token_id = 99
-        req = scheduler.create_request(prompt_tokens=[1, 2, 3], max_new_tokens=5)
+        # Make the stub emit the EOS token deterministically (greedy).
+        mock_tokenizer.eos_token_id = scheduler.model.force_token
+        req = scheduler.create_request(
+            prompt_tokens=[1, 2, 3], max_new_tokens=5, temperature=0.0
+        )
 
-        scheduler.step()  # Generates token 99 which equals EOS
+        scheduler.step()  # Prefill emits the EOS token
         assert req.is_finished
         assert req.finish_reason == "stop"
         assert scheduler.stats["active"] == 0
@@ -572,6 +625,44 @@ class TestServerEndpoints:
             )
             assert response.status_code == 422  # Validation error
 
+    def test_chat_completions_via_scheduler(
+        self, stub_model, mock_tokenizer, block_manager, monkeypatch
+    ):
+        """/v1/chat/completions routes through the continuous-batching scheduler."""
+        from fastapi.testclient import TestClient
+        import selfllm.serving.server as server_module
+
+        sched = ContinuousBatchingScheduler(
+            model=stub_model, tokenizer=mock_tokenizer,
+            block_manager=block_manager, max_batch_size=4, device="cpu",
+        )
+        thread = threading.Thread(target=sched.run, daemon=True)
+        thread.start()
+
+        monkeypatch.setattr(server_module, "_model", stub_model)
+        monkeypatch.setattr(server_module, "_tokenizer", mock_tokenizer)
+        monkeypatch.setattr(server_module, "_scheduler", sched)
+
+        try:
+            with TestClient(server_module.app) as client:
+                response = client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "selfllm",
+                        "messages": [{"role": "user", "content": "Hi"}],
+                        "max_tokens": 3,
+                    },
+                )
+                assert response.status_code == 200
+                data = response.json()
+                assert data["choices"][0]["message"]["role"] == "assistant"
+                assert data["usage"]["completion_tokens"] >= 1
+                # The request actually flowed through the scheduler.
+                assert sched.stats["total_served"] >= 1
+        finally:
+            sched.shutdown()
+            thread.join(timeout=2.0)
+
     def test_streaming_chat_completions(self, mock_model, monkeypatch):
         """/v1/chat/completions with stream=True returns SSE."""
         from fastapi.testclient import TestClient
@@ -664,16 +755,14 @@ class TestEndToEnd:
         # All blocks should be returned
         assert scheduler.block_manager.num_free_blocks == initial_free
 
-    def test_request_with_zero_temperature(self, scheduler, mock_model):
-        """Request with temperature=0 triggers greedy decoding path."""
-        mock_model.generate.return_value = {
-            "sequences": torch.tensor([[42, 77]]),
-        }
+    def test_request_with_zero_temperature(self, scheduler):
+        """Request with temperature=0 triggers the greedy decoding path."""
         req = scheduler.create_request(
             prompt_tokens=[1, 2, 3], max_new_tokens=1, temperature=0.0
         )
         scheduler.step()
         assert req.is_finished
+        assert req.generated_tokens[0] == scheduler.model.force_token
 
     def test_request_ordering(self, scheduler):
         """Requests are processed in FIFO order."""

@@ -84,25 +84,50 @@ class RoPEMultiHeadAttention(nn.Module):
         angles = torch.outer(positions, freqs)  # [max_seq_len, head_dim//2]
         return angles.float()  # [max_seq_len, head_dim//2]
 
-    def _apply_rope(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
+    def _apply_rope(
+        self,
+        x: torch.Tensor,
+        seq_len: int,
+        start_pos: int = 0,
+        positions: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Apply rotary position embedding to input tensor.
 
         Args:
             x: Tensor of shape ``[batch, n_heads, seq_len, head_dim]``.
             seq_len: Sequence length.
+            start_pos: Absolute position of the first token (used when
+                ``positions`` is ``None``). Non-zero during incremental
+                decoding, where ``x`` holds new tokens that follow ``start_pos``
+                already-cached positions.
+            positions: Optional explicit absolute positions of shape
+                ``[batch, seq_len]``. When given, each batch row is rotated by
+                its own positions -- required for batched decoding where every
+                request sits at a different point in its sequence.
 
         Returns:
             Rotated tensor of same shape.
         """
         # x shape: [batch, n_heads, seq_len, head_dim]
-        freqs = self.rope_freqs[:seq_len]  # [seq_len, head_dim//2]
+        max_pos = self.rope_freqs.shape[0]
+
+        if positions is not None:
+            # Per-row positions: [batch, seq_len] -> freqs [batch, seq_len, hd//2]
+            pos = positions.clamp(min=0, max=max_pos - 1)
+            freqs = self.rope_freqs[pos]  # [batch, seq_len, head_dim//2]
+            cos_freqs = torch.cos(freqs).unsqueeze(1)  # [batch, 1, seq_len, hd//2]
+            sin_freqs = torch.sin(freqs).unsqueeze(1)
+        else:
+            # Clamp into the precomputed range so decoding past max_seq_len
+            # cannot index out of bounds (positions saturate at the final entry).
+            start_pos = min(start_pos, max(0, max_pos - seq_len))
+            freqs = self.rope_freqs[start_pos : start_pos + seq_len]  # [seq_len, hd//2]
+            cos_freqs = torch.cos(freqs).unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, hd//2]
+            sin_freqs = torch.sin(freqs).unsqueeze(0).unsqueeze(0)
 
         # Split last dimension into pairs
         x1 = x[..., 0::2]  # [batch, n_heads, seq_len, head_dim//2]
         x2 = x[..., 1::2]  # [batch, n_heads, seq_len, head_dim//2]
-
-        cos_freqs = torch.cos(freqs).unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, hd//2]
-        sin_freqs = torch.sin(freqs).unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, hd//2]
 
         # Apply rotation: [x0, x1] * [cos(m*freq), sin(m*freq)]
         rx1 = x1 * cos_freqs - x2 * sin_freqs
@@ -121,6 +146,8 @@ class RoPEMultiHeadAttention(nn.Module):
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        positions: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """Forward pass for multi-head attention with RoPE.
 
@@ -130,6 +157,12 @@ class RoPEMultiHeadAttention(nn.Module):
                   If ``None``, a causal mask is created automatically.
             kv_cache: Optional tuple of ``(cached_k, cached_v)`` for autoregressive
                       generation. Each has shape ``[batch, n_heads, cache_len, head_dim]``.
+            positions: Optional explicit absolute positions ``[batch, seq_len]`` for
+                      the new tokens (batched decoding where each request is at a
+                      different position). Overrides the cache-length offset.
+            key_padding_mask: Optional boolean mask ``[batch, cache_len]`` marking
+                      which cached positions are valid (``True``). Used to batch
+                      requests whose caches were right-padded to a common length.
 
         Returns:
             - Output tensor ``[batch, seq_len, d_model]``.
@@ -147,11 +180,16 @@ class RoPEMultiHeadAttention(nn.Module):
         k = k.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Apply RoPE to Q and K
-        q = self._apply_rope(q, seq_len)
-        k = self._apply_rope(k, seq_len)
+        # Apply RoPE to Q and K. During incremental decoding the new tokens
+        # sit at absolute positions starting just after the cached ones; for
+        # batched decode each row has its own position.
+        cache_len = kv_cache[0].shape[2] if kv_cache is not None else 0
+        q = self._apply_rope(q, seq_len, start_pos=cache_len, positions=positions)
+        k = self._apply_rope(k, seq_len, start_pos=cache_len, positions=positions)
 
-        # Merge with KV cache if provided (autoregressive generation)
+        # Merge with KV cache if provided (autoregressive generation).
+        # The cached K/V were already rotated when they were produced, so only
+        # the new tokens are rotated above before concatenation.
         if kv_cache is not None:
             cached_k, cached_v = kv_cache
             k = torch.cat([cached_k, k], dim=2)
@@ -170,9 +208,16 @@ class RoPEMultiHeadAttention(nn.Module):
         else:
             causal_mask = mask
 
-        # Scaled dot-product attention (Flash Attention when available)
-        # PyTorch 2.0+ scaled_dot_product_attention handles causal masking internally
-        if mask is None and hasattr(F, "scaled_dot_product_attention"):
+        # Whether the explicit masked path is required (SDPA's is_causal shortcut
+        # assumes a square q_len == kv_len matrix and cannot express padding).
+        use_manual = not (
+            mask is None
+            and kv_cache is None
+            and key_padding_mask is None
+            and hasattr(F, "scaled_dot_product_attention")
+        )
+
+        if not use_manual:
             attn_out = F.scaled_dot_product_attention(
                 q,
                 k,
@@ -187,6 +232,19 @@ class RoPEMultiHeadAttention(nn.Module):
 
             if causal_mask is not None:
                 scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+            # Key-padding mask: invalidate padded cached positions per row. The
+            # mask covers the cached keys; the new (seq_len) keys are always
+            # valid, so extend with a True block before applying.
+            if key_padding_mask is not None:
+                new_valid = torch.ones(
+                    batch, seq_len, device=x.device, dtype=torch.bool
+                )
+                full_valid = torch.cat([key_padding_mask, new_valid], dim=1)  # [B, kv_len]
+                pad = ~full_valid  # True where it should be masked out
+                scores = scores.masked_fill(
+                    pad.unsqueeze(1).unsqueeze(2), float("-inf")
+                )
 
             attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
             attn_weights = self.attn_dropout(attn_weights)
