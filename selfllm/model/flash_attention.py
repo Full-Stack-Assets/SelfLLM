@@ -160,7 +160,10 @@ class FlashAttention2(nn.Module):
 
         Args:
             x: Input tensor ``[batch, seq_len, d_model]``.
-            mask: Optional causal mask (unused, kept for API compatibility).
+            mask: Optional explicit attention mask (``True`` = masked out). When
+                provided (e.g. a non-causal mask for a vision encoder or a
+                block-wise multimodal mask), it is honoured via the manual
+                attention path; when ``None`` the fast causal kernel is used.
             kv_cache: Optional tuple of ``(cached_k, cached_v)`` for autoregressive
                 generation. Each has shape ``[batch, cache_len, n_heads, head_dim]``.
             is_prefill: ``True`` for full-sequence (prefill) mode,
@@ -201,8 +204,13 @@ class FlashAttention2(nn.Module):
             v = torch.cat([cached_v, v], dim=1)
         new_cache = (k, v)
 
-        # 5. Attention computation
-        if HAS_FLASH_ATTN and (q.dtype in (torch.float16, torch.bfloat16)):
+        # 5. Attention computation. The flash kernel only expresses causal /
+        # full attention, so an explicit custom mask routes to the manual path.
+        if (
+            mask is None
+            and HAS_FLASH_ATTN
+            and (q.dtype in (torch.float16, torch.bfloat16))
+        ):
             # Flash Attention 2 path (requires fp16/bf16)
             if kv_cache is not None and not is_prefill:
                 out = flash_attn_with_kvcache(
@@ -213,15 +221,15 @@ class FlashAttention2(nn.Module):
                     q, k, v, causal=True, softmax_scale=None,
                 )
         else:
-            # Fallback: manual scaled dot-product attention
-            if HAS_FLASH_ATTN and q.dtype == torch.float32:
+            # Fallback: manual scaled dot-product attention (honours `mask`).
+            if mask is None and HAS_FLASH_ATTN and q.dtype == torch.float32:
                 warnings.warn(
                     "Flash Attention 2 requires fp16/bf16; falling back to manual "
                     "attention. Consider using torch.autocast for mixed-precision "
                     "training/inference.",
                     stacklevel=2,
                 )
-            out = self._manual_attention(q, k, v, is_prefill)
+            out = self._manual_attention(q, k, v, is_prefill, mask=mask)
 
         # 6. Reshape and output projection
         out = out.reshape(batch, seq_len, self.d_model)
@@ -235,11 +243,14 @@ class FlashAttention2(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         is_prefill: bool,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Manual causal scaled dot-product attention (fallback).
+        """Manual scaled dot-product attention (fallback).
 
-        Operates on Flash Attention layout ``[B, T, H, D]``;
-        transposes internally to ``[B, H, T, D]`` for the matmuls.
+        Operates on Flash Attention layout ``[B, T, H, D]``; transposes
+        internally to ``[B, H, T, D]`` for the matmuls. When ``mask`` is given
+        (``True`` = masked out) it is applied verbatim; otherwise a standard
+        causal mask is used.
         """
         q_t = q.transpose(1, 2)  # [B, H, T_q, D]
         k_t = k.transpose(1, 2)  # [B, H, T_k, D]
@@ -249,7 +260,16 @@ class FlashAttention2(nn.Module):
 
         q_len = q_t.shape[2]
         kv_len = k_t.shape[2]
-        if is_prefill or q_len > 1:
+        if mask is not None:
+            # Broadcast the mask to [B, H, q_len, kv_len].
+            if mask.dim() == 2:
+                m = mask.unsqueeze(0).unsqueeze(0)
+            elif mask.dim() == 3:
+                m = mask.unsqueeze(1)
+            else:
+                m = mask
+            scores = scores.masked_fill(m, float("-inf"))
+        elif is_prefill or q_len > 1:
             causal_mask = torch.triu(
                 torch.ones(q_len, kv_len, device=q.device, dtype=torch.bool),
                 diagonal=1,
