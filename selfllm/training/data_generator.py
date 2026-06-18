@@ -252,11 +252,16 @@ class SelfTrainingDataGenerator:
                         }
                     )
 
-            except torch.cuda.OutOfMemoryError:
+            except (RuntimeError, MemoryError) as oom:
+                # Covers CUDA OOM (torch.cuda.OutOfMemoryError is a RuntimeError)
+                # as well as CPU memory errors, which surface as RuntimeError /
+                # MemoryError rather than the CUDA-specific type.
                 logger.warning(
-                    f"CUDA OOM on batch {i}. Clearing cache and retrying with smaller batch."
+                    f"Out-of-memory / runtime error on batch {i} "
+                    f"({type(oom).__name__}). Retrying one prompt at a time."
                 )
-                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 # Retry one by one
                 for prompt_text in batch_prompts:
                     try:

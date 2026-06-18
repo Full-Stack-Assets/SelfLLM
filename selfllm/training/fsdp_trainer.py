@@ -468,11 +468,13 @@ class FSDPTrainer:
         """
         train_loader = self._get_dataloader(train_dataset, shuffle=True)
 
-        # Scheduler
-        total_steps = (
-            len(train_loader)
-            // self.gradient_accumulation_steps
-            * num_epochs
+        # Scheduler. Use ceil and a floor of 1 so the trailing accumulation
+        # window is counted and the horizon never collapses to 0 on tiny
+        # datasets (which would force the LR straight to its minimum).
+        total_steps = max(
+            1,
+            math.ceil(len(train_loader) / self.gradient_accumulation_steps)
+            * num_epochs,
         )
         warmup_steps = int(total_steps * self.warmup_ratio)
         scheduler = get_lr_scheduler(self.optimizer, warmup_steps, total_steps)

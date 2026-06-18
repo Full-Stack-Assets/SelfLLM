@@ -60,7 +60,7 @@ def merge_config(yaml_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dict
 
     # Model config
     model_cfg = dict(yaml_cfg.get("model", {}))
-    if cli_args.vocab_size is not None:
+    if getattr(cli_args, "vocab_size", None) is not None:
         model_cfg["vocab_size"] = cli_args.vocab_size
     if getattr(cli_args, "d_model", None) is not None:
         model_cfg["d_model"] = cli_args.d_model
@@ -427,6 +427,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-batch-size", type=int, default=32, help="Maximum concurrent batch size (default: 32)."
     )
 
+    # ------------------------------------------------------------------
+    # fsdp-pretrain (multi-GPU)
+    # ------------------------------------------------------------------
+    fsdp_parser = subparsers.add_parser(
+        "fsdp-pretrain",
+        help="Pre-train with multi-GPU FSDP (launch via torchrun).",
+        description=(
+            "Fully Sharded Data Parallel pre-training. Launch with "
+            "`torchrun --nproc_per_node=N -m selfllm fsdp-pretrain ...`; "
+            "also runs single-process for local testing."
+        ),
+    )
+    fsdp_parser.add_argument(
+        "--data-path", type=str, required=True, help="Path to the training corpus (text file)."
+    )
+    fsdp_parser.add_argument(
+        "--num-epochs", type=int, default=None, help="Number of training epochs."
+    )
+    fsdp_parser.add_argument(
+        "--batch-size", type=int, default=None, help="Per-device micro-batch size."
+    )
+    fsdp_parser.add_argument(
+        "--learning-rate", type=float, default=None, help="Peak learning rate."
+    )
+    fsdp_parser.add_argument(
+        "--save-every", type=int, default=None, help="Save a checkpoint every N epochs."
+    )
+
     return parser
 
 
@@ -546,6 +574,86 @@ def cmd_pretrain(cfg: Dict[str, Any], logger: Logger) -> None:
     # Save training history
     from selfllm.utils import save_json
     save_json(history, str(checkpoint_dir / "training_history.json"))
+
+
+def cmd_fsdp_pretrain(cfg: Dict[str, Any], logger: Logger) -> None:
+    """Pre-train the model with multi-GPU FSDP.
+
+    Intended for ``torchrun --nproc_per_node=N -m selfllm fsdp-pretrain``; the
+    FSDP trainer also creates a single-process group automatically for local
+    testing.
+    """
+    from selfllm.model.config import ModelConfig
+    from selfllm.model.model import SelfImprovingLLM
+    from selfllm.model.tokenizer import BPETokenizer
+    from selfllm.training.dataset import SelfTrainingDataset
+    from selfllm.training.fsdp_trainer import FSDPTrainer
+
+    data_path = cfg.get("data_path", "")
+    if not data_path or not Path(data_path).exists():
+        logger.error(f"Data path not found: {data_path}")
+        sys.exit(1)
+
+    with open(data_path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+
+    tokenizer = BPETokenizer(vocab_size=cfg["model"].get("vocab_size", 32000))
+    logger.info("Training tokenizer on seed corpus...")
+    tokenizer.train([text])
+
+    checkpoint_dir = Path(cfg["checkpoint_dir"])
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    tokenizer.save(str(checkpoint_dir / "tokenizer"))
+
+    # Build pre-training samples by chunking the corpus into fixed-size pieces.
+    max_seq_len = cfg["model"].get("max_seq_len", 512)
+    chunk_chars = max(1, max_seq_len * 4)  # rough chars-per-token heuristic
+    samples = [
+        {"prompt": "", "response": text[i : i + chunk_chars]}
+        for i in range(0, len(text), chunk_chars)
+        if text[i : i + chunk_chars].strip()
+    ]
+    dataset = SelfTrainingDataset(
+        samples=samples, tokenizer=tokenizer, max_seq_len=max_seq_len
+    )
+    logger.info(f"Dataset created: {len(dataset)} sequences")
+
+    model_cfg = ModelConfig(
+        vocab_size=cfg["model"].get("vocab_size", 32000),
+        d_model=cfg["model"].get("d_model", 512),
+        n_layers=cfg["model"].get("n_layers", 8),
+        n_heads=cfg["model"].get("n_heads", 8),
+        d_ff=cfg["model"].get("d_ff", 2048),
+        max_seq_len=cfg["model"].get("max_seq_len", 512),
+        dropout=cfg["model"].get("dropout", 0.1),
+        use_rope=cfg["model"].get("use_rope", True),
+        use_swiglu=cfg["model"].get("use_swiglu", True),
+    )
+    model = SelfImprovingLLM(model_cfg)
+
+    training = cfg.get("training", {})
+    trainer = FSDPTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        learning_rate=training.get("learning_rate", 1e-4),
+        weight_decay=training.get("weight_decay", 0.01),
+        batch_size=training.get("batch_size", 4),
+        gradient_accumulation_steps=training.get("gradient_accumulation_steps", 4),
+        max_grad_norm=training.get("max_grad_norm", 1.0),
+        warmup_ratio=training.get("warmup_ratio", 0.1),
+        device=cfg["device"],
+    )
+
+    num_epochs = training.get("num_epochs", 10)
+    logger.info("Starting FSDP pre-training...")
+    try:
+        trainer.train(dataset, num_epochs=num_epochs)
+        ckpt_path = str(checkpoint_dir / "fsdp_pretrained.pt")
+        trainer.save_checkpoint(ckpt_path)
+        if trainer.is_main_process:
+            logger.info(f"FSDP pre-training complete. Checkpoint: {ckpt_path}")
+    finally:
+        FSDPTrainer.cleanup_process_group()
 
 
 def cmd_self_improve(cfg: Dict[str, Any], logger: Logger) -> None:
@@ -908,6 +1016,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     command_map = {
         "init": cmd_init,
         "pretrain": cmd_pretrain,
+        "fsdp-pretrain": cmd_fsdp_pretrain,
         "self-improve": cmd_self_improve,
         "real-training": cmd_real_training,
         "generate": cmd_generate,

@@ -390,9 +390,14 @@ class DPOTrainer:
         self.policy_model.train()
         self.reference_model.eval()
 
-        # Create dataset and dataloader
+        # Create dataset and dataloader. Cap sequence length at the model's
+        # context window so prompt+response never exceeds the positional range
+        # (which would otherwise raise a shape mismatch in the forward pass).
+        model_max = getattr(
+            getattr(self.policy_model, "config", None), "max_seq_len", 512
+        )
         dataset = PreferenceDataset(
-            preference_pairs, self.tokenizer, max_seq_len=512
+            preference_pairs, self.tokenizer, max_seq_len=min(512, model_max)
         )
         dataloader = DataLoader(
             dataset,

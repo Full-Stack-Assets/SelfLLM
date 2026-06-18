@@ -223,6 +223,10 @@ class SelfImprovingLLM(nn.Module):
         next_token: Optional[torch.Tensor] = None
         max_len = self.config.max_seq_len
 
+        # Per-sequence completion tracking so each row in the batch stops at its
+        # own stop token rather than waiting for every row to emit one.
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
         for step in range(max_new_tokens):
             # Prepare inputs
             if past_key_values is None:
@@ -292,6 +296,14 @@ class SelfImprovingLLM(nn.Module):
                 batch_idx = torch.arange(batch_size, device=device)
                 scores.append(probs[batch_idx, next_token.squeeze(-1)])
 
+            # Sequences that already hit the stop token keep emitting it, so a
+            # finished row is not extended with fresh content while other rows
+            # continue generating.
+            if stop_token_id is not None:
+                next_token = next_token.masked_fill(
+                    finished.unsqueeze(-1), stop_token_id
+                )
+
             # Update seen tokens
             if seen_tokens is not None:
                 for b in range(batch_size):
@@ -300,9 +312,11 @@ class SelfImprovingLLM(nn.Module):
             # Append to generated sequence
             generated = torch.cat([generated, next_token], dim=1)
 
-            # Check for stop token
-            if stop_token_id is not None and (next_token == stop_token_id).all():
-                break
+            # Stop only once every sequence in the batch has emitted the stop token.
+            if stop_token_id is not None:
+                finished = finished | (next_token.squeeze(-1) == stop_token_id)
+                if bool(finished.all()):
+                    break
 
         result: Dict[str, torch.Tensor] = {
             "sequences": generated,

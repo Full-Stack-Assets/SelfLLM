@@ -277,10 +277,13 @@ class LLMTrainer:
 
         optimizer = self._create_optimizer()
 
-        total_steps = (
-            len(train_loader)
-            // self.gradient_accumulation_steps
-            * num_epochs
+        # Use ceil so the trailing (incomplete) accumulation window -- which
+        # now produces an optimizer step -- is counted, and never let the
+        # scheduler horizon collapse to 0 on tiny datasets.
+        total_steps = max(
+            1,
+            math.ceil(len(train_loader) / self.gradient_accumulation_steps)
+            * num_epochs,
         )
         scheduler = self._create_scheduler(optimizer, total_steps)
 
@@ -431,6 +434,28 @@ class LLMTrainer:
                     "tok/s": f"{tok_meter.avg:.0f}",
                 }
             )
+
+        # Flush a trailing incomplete accumulation window so the epoch's final
+        # batches contribute an optimizer step instead of being discarded.
+        if len(dataloader) > 0 and (step + 1) % self.gradient_accumulation_steps != 0:
+            if self.use_amp and self.scaler is not None:
+                self.scaler.unscale_(optimizer)
+
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.max_grad_norm
+            )
+
+            if self.use_amp and self.scaler is not None:
+                self.scaler.step(optimizer)
+                self.scaler.update()
+            else:
+                optimizer.step()
+
+            optimizer.zero_grad()
+            scheduler.step()
+
+            self.global_step += 1
+            lr_meter.update(scheduler.get_last_lr()[0])
 
         self.history["learning_rate"].append(lr_meter.avg)
         self.history["tokens_per_sec"].append(tok_meter.avg)

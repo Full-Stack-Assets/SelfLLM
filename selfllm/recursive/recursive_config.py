@@ -34,6 +34,11 @@ class RecursiveConfig:
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
 
+    # DPO preference alignment (optional, runs after each fine-tune step)
+    use_dpo: bool = False
+    dpo_beta: float = 0.1
+    dpo_epochs: int = 1
+
     # Experience Replay
     replay_buffer_size: int = 10000
     replay_ratio: float = 0.3  # % of training from past iterations

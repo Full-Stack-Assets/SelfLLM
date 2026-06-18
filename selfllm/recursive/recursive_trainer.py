@@ -217,7 +217,6 @@ class RecursiveSelfTrainer:
             is_improved = False
 
             # Save metrics and return
-            self.iteration += 1
             metrics = {
                 "iteration": self.iteration,
                 "samples_generated": samples_generated,
@@ -256,6 +255,12 @@ class RecursiveSelfTrainer:
         )
         print(f"  Average training loss: {avg_loss:.4f}")
 
+        # Optional DPO preference-alignment pass. Self-critic generates several
+        # responses per eval prompt, ranks them, and optimizes the policy toward
+        # the preferred ones. Guarded so a failure here never aborts the loop.
+        if getattr(self.config, "use_dpo", False):
+            self._run_dpo_step()
+
         # Step 5: Evaluate
         print(f"[Step 5/7] Running evaluation suite ...")
         eval_metrics = self.evaluator.full_evaluation()
@@ -285,6 +290,9 @@ class RecursiveSelfTrainer:
                 print(f"[Step 7/7] Saving checkpoint to {checkpoint_path} ...")
                 self.model.save_pretrained(checkpoint_path)
                 self.best_checkpoint_path = checkpoint_path
+
+                # Enforce the checkpoint retention policy.
+                self._cleanup_old_checkpoints()
 
             # Update best metrics
             self.best_metrics = eval_metrics.copy()
@@ -333,12 +341,7 @@ class RecursiveSelfTrainer:
         self.metrics_history.append(iteration_metrics)
 
         # Save metrics to JSON
-        metrics_path = os.path.join(
-            self.config.checkpoint_dir, "metrics_history.json"
-        )
-        with open(metrics_path, "w") as f:
-            json.dump(self.metrics_history, f, indent=2)
-        print(f"  Metrics saved to {metrics_path}")
+        self._save_metrics_history()
         print(f"  Iteration duration: {iter_duration:.1f}s")
 
         return iteration_metrics
@@ -368,17 +371,21 @@ class RecursiveSelfTrainer:
         """
         self.model.train()
 
-        # Create data loader
+        # Create data loader. Keep the final partial batch -- on the small
+        # datasets produced per iteration, dropping it wastes data and biases
+        # gradients toward whatever happens to fill complete batches.
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=True,
-            drop_last=True,
+            drop_last=False,
         )
 
-        # Compute total training steps for scheduler
-        steps_per_epoch = len(dataloader) // gradient_accumulation_steps
-        total_steps = steps_per_epoch * num_epochs
+        # Compute total optimizer steps for the scheduler. Use ceil so the
+        # final (incomplete) accumulation window, which still produces an
+        # optimizer step below, is counted.
+        steps_per_epoch = max(1, math.ceil(len(dataloader) / gradient_accumulation_steps))
+        total_steps = max(1, steps_per_epoch * num_epochs)
         warmup_steps = int(total_steps * self.config.warmup_ratio)
 
         # Optimizer
@@ -446,13 +453,23 @@ class RecursiveSelfTrainer:
                     optimizer.zero_grad()
                     global_step += 1
 
+            # Flush gradients from a trailing incomplete accumulation window so
+            # the epoch's last batches actually contribute an update instead of
+            # being silently discarded.
+            if len(dataloader) > 0 and (batch_idx + 1) % gradient_accumulation_steps != 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.max_grad_norm,
+                )
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                global_step += 1
+
             avg_epoch_loss = epoch_loss / max(len(dataloader), 1)
             current_lr = scheduler.get_last_lr()[0]
             print(f"    Epoch {epoch + 1}/{num_epochs}: "
                   f"loss={avg_epoch_loss:.4f}, lr={current_lr:.2e}")
-
-        # Handle remaining accumulated gradients
-        optimizer.zero_grad(set_to_none=True)
 
         avg_loss = total_loss / max(num_batches, 1)
         return avg_loss
@@ -644,8 +661,64 @@ class RecursiveSelfTrainer:
               f"{os.path.join(self.config.checkpoint_dir, 'metrics_history.json')}")
         print(f"{'#' * 60}\n")
 
+    def _run_dpo_step(self) -> None:
+        """Run a DPO preference-alignment pass over the eval prompts.
+
+        Builds (prompt, chosen, rejected) pairs via the DPO trainer's
+        self-critic generator and optimizes the policy model in place. Wrapped
+        in a guard so any failure degrades gracefully instead of aborting the
+        recursive loop.
+        """
+        try:
+            from ..training.dpo_trainer import DPOTrainer
+
+            print("[Step 4b] DPO preference alignment ...")
+            dpo = DPOTrainer(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                beta=self.config.dpo_beta,
+                learning_rate=self.config.learning_rate,
+                batch_size=self.config.batch_size,
+                device=self.device,
+            )
+            pairs = dpo.generate_preferences(
+                self.config.eval_prompts,
+                num_samples=max(2, self.config.responses_per_prompt),
+                temperature=self.config.generation_temperature,
+                top_p=self.config.generation_top_p,
+            )
+            if not pairs:
+                print("  No preference pairs generated; skipping DPO.")
+                return
+            metrics = dpo.train_step(pairs, num_epochs=self.config.dpo_epochs)
+            print(
+                f"  DPO: loss={metrics.get('loss', 0.0):.4f}, "
+                f"reward_margin={metrics.get('reward_margin', 0.0):.4f}, "
+                f"accuracy={metrics.get('accuracy', 0.0):.4f}"
+            )
+        except Exception as e:  # pragma: no cover - defensive guard
+            print(f"  ⚠️  DPO step failed ({type(e).__name__}: {e}); continuing.")
+
+    def _save_metrics_history(self) -> None:
+        """Persist the full metrics history to JSON in the checkpoint dir."""
+        metrics_path = os.path.join(
+            self.config.checkpoint_dir, "metrics_history.json"
+        )
+        with open(metrics_path, "w") as f:
+            json.dump(self.metrics_history, f, indent=2)
+        print(f"  Metrics saved to {metrics_path}")
+
     def _cleanup_old_checkpoints(self) -> None:
-        """Remove old checkpoints, keeping only the last N."""
+        """Remove old checkpoints, keeping only the last N.
+
+        The current best checkpoint is always preserved so rollback remains
+        possible even if it is older than the retention window.
+        """
+        best_dir = (
+            os.path.basename(self.best_checkpoint_path)
+            if self.best_checkpoint_path
+            else None
+        )
         checkpoint_dirs = [
             d
             for d in os.listdir(self.config.checkpoint_dir)
@@ -658,6 +731,8 @@ class RecursiveSelfTrainer:
         if len(checkpoint_dirs) > self.config.keep_last_n:
             to_remove = checkpoint_dirs[: -self.config.keep_last_n]
             for d in to_remove:
+                if d == best_dir:
+                    continue  # never delete the best checkpoint
                 path = os.path.join(self.config.checkpoint_dir, d)
                 shutil.rmtree(path, ignore_errors=True)
                 print(f"  Cleaned up old checkpoint: {path}")

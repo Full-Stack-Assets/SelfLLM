@@ -311,6 +311,8 @@ async def _stream_generate(
     # prompt + tokens emitted so far; feeding only the last token would strip
     # all prior context (generate() keeps no KV cache across calls).
     generated_ids: List[int] = []
+    emitted_text = ""
+    stop_sequences = request.stop or []
 
     for _ in range(request.max_tokens):
         input_ids = torch.tensor([prompt_tokens + generated_ids], device=device)
@@ -328,10 +330,35 @@ async def _stream_generate(
             break
 
         generated_ids.append(token_id)
-        text = _tokenizer.decode([token_id])
-        yield f"data: {json.dumps({'choices': [{'delta': {'content': text}}]})}\n\n"
+        # Decode cumulatively so stop sequences spanning multiple tokens are
+        # detected and the incremental delta is exact.
+        full_text = _tokenizer.decode(generated_ids)
+
+        stop_idx = _first_stop_index(full_text, stop_sequences)
+        if stop_idx is not None:
+            remaining = full_text[len(emitted_text):stop_idx]
+            if remaining:
+                yield f"data: {json.dumps({'choices': [{'delta': {'content': remaining}}]})}\n\n"
+            break
+
+        new_text = full_text[len(emitted_text):]
+        if new_text:
+            yield f"data: {json.dumps({'choices': [{'delta': {'content': new_text}}]})}\n\n"
+            emitted_text = full_text
 
     yield "data: [DONE]\n\n"
+
+
+def _first_stop_index(text: str, stop_sequences: List[str]) -> Optional[int]:
+    """Return the earliest index at which any stop sequence occurs, else None."""
+    best: Optional[int] = None
+    for stop in stop_sequences:
+        if not stop:
+            continue
+        idx = text.find(stop)
+        if idx != -1 and (best is None or idx < best):
+            best = idx
+    return best
 
 
 def serve(
@@ -340,6 +367,9 @@ def serve(
     host: str = "0.0.0.0",
     port: int = 8000,
     max_batch_size: int = 32,
+    block_size: int = 16,
+    num_blocks: Optional[int] = None,
+    kv_cache_mem_gb: float = 4.0,
 ) -> None:
     """Launch the API server with PagedAttention backend.
 
@@ -352,6 +382,11 @@ def serve(
         host: Host address to bind to.
         port: Port to listen on.
         max_batch_size: Maximum concurrent requests in the scheduler.
+        block_size: Tokens per KV cache block.
+        num_blocks: Number of KV cache blocks. If ``None``, derived from
+            ``kv_cache_mem_gb`` and the model's KV footprint per block.
+        kv_cache_mem_gb: Target KV cache budget (GB) used to size ``num_blocks``
+            when it is not given explicitly.
     """
     import uvicorn
 
@@ -371,16 +406,27 @@ def serve(
     device = "cuda" if torch.cuda.is_available() else "cpu"
     _model = _model.to(device).eval()
 
-    # Setup PagedAttention block manager
+    # Setup PagedAttention block manager. Size the pool from a memory budget
+    # instead of a hard-coded constant so it scales with model dimensions.
     config = _model.config
-    block_size = 16
-    num_blocks = 1000  # Configure based on GPU memory
+    head_dim = config.d_model // config.n_heads
+    if num_blocks is None:
+        dtype_bytes = 2  # fp16/bf16 KV cache
+        bytes_per_block = (
+            2  # K + V
+            * config.n_layers
+            * block_size
+            * config.n_heads
+            * head_dim
+            * dtype_bytes
+        )
+        num_blocks = max(1, int(kv_cache_mem_gb * (1024 ** 3) // bytes_per_block))
     block_manager = BlockManager(
         num_blocks=num_blocks,
         block_size=block_size,
         num_layers=config.n_layers,
         num_heads=config.n_heads,
-        head_dim=config.d_model // config.n_heads,
+        head_dim=head_dim,
         device=device,
     )
 
