@@ -26,23 +26,34 @@ docker build -t selfllm-server .
 docker run -p 8000:8000 -e SELFLLM_API_KEY=sk-pick-a-secret selfllm-server
 ```
 
-**Google Cloud Run** (recommended — managed containers, scale-to-zero, HTTPS URL):
+**Fly.io** (recommended — simplest; one `fly.toml`, one command):
 
 ```bash
-gcloud auth login
-gcloud config set project YOUR_PROJECT
+curl -L https://fly.io/install.sh | sh    # install flyctl, then: fly auth login
+# edit `app = "..."` in fly.toml to a unique name; model present at ./real_model
+SELFLLM_API_KEY=sk-pick-a-secret ./deploy/fly/deploy.sh
+```
+
+`fly deploy` builds the Dockerfile from your **local directory**, so the baked
+`real_model/` is included even though it's gitignored (no commit, no registry,
+no project/IAM setup). `fly.toml` sets 2GB/2cpu, scale-to-zero, and a `/health`
+check; the Bearer key is set as a Fly secret. The app URL
+`https://<app>.fly.dev` is your provider **base URL** (append `/v1`).
+
+**Google Cloud Run** (alternative — managed, scale-to-zero, but more setup):
+
+```bash
+gcloud auth login && gcloud config set project YOUR_PROJECT
 gcloud services enable run.googleapis.com cloudbuild.googleapis.com
-# trained model present at ./real_model
 SELFLLM_API_KEY=sk-pick-a-secret REGION=us-central1 ./deploy/cloudrun/deploy.sh
 ```
 
-`deploy/cloudrun/deploy.sh` builds from the Dockerfile via Cloud Build
-(`--source .`, no local Docker needed; `.gcloudignore` keeps `real_model/` in
-the upload) and deploys with `--allow-unauthenticated` + `--memory 2Gi --cpu 2
---timeout 300`. The service is **public but gated by your Bearer key** (Cloud
-Run IAM is off; `SELFLLM_API_KEY` is the auth). The script prints the HTTPS
-service URL — that's your provider **base URL** (append `/v1`). The server
-listens on Cloud Run's injected `$PORT` automatically.
+Builds via Cloud Build (`--source .`; `.gcloudignore` keeps `real_model/`),
+`--allow-unauthenticated` + 2Gi/2cpu/300s, public but gated by your Bearer key.
+
+> Both build from local context, so they work with the gitignored baked model.
+> Git-repo builders (Render, Railway-via-GitHub) would not have `real_model/`
+> unless you commit it or fetch it at startup.
 
 When `SELFLLM_API_KEY` is set, the `/v1/*` inference endpoints require
 `Authorization: Bearer <key>`.
