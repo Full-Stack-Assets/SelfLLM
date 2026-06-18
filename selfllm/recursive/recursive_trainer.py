@@ -674,6 +674,19 @@ class RecursiveSelfTrainer:
             print(f"    Quality:    {quality_change:+.4f} "
                   f"({first['quality_score']:.4f} -> {last['quality_score']:.4f})")
 
+            # Surface any eval-suite benchmark trajectories recorded by the hook.
+            from .report import detect_benchmark_keys, summarize_metrics
+
+            benchmark_keys = detect_benchmark_keys(self.metrics_history)
+            if benchmark_keys:
+                summary = summarize_metrics(self.metrics_history)
+                print(f"\n  Benchmarks (first -> last):")
+                for key in benchmark_keys:
+                    if key in summary:
+                        s = summary[key]
+                        print(f"    {key[len('benchmark_'):]}: "
+                              f"{s['first']:.4f} -> {s['last']:.4f} ({s['delta']:+.4f})")
+
         print(f"\n  Metrics saved to: "
               f"{os.path.join(self.config.checkpoint_dir, 'metrics_history.json')}")
         print(f"{'#' * 60}\n")
