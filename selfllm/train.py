@@ -143,6 +143,10 @@ def merge_config(yaml_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dict
     merged["device"] = getattr(cli_args, "device", None) or yaml_cfg.get("device", get_device())
     merged["seed"] = getattr(cli_args, "seed", None) or yaml_cfg.get("seed", 42)
     merged["data_path"] = getattr(cli_args, "data_path", None) or yaml_cfg.get("data_path", "")
+    for _k in ("host", "port", "max_batch_size"):
+        _v = getattr(cli_args, _k, None)
+        if _v is not None:
+            merged[_k] = _v
     merged["model_path"] = getattr(cli_args, "model_path", None) or yaml_cfg.get("model_path", "")
     merged["tokenizer_path"] = getattr(cli_args, "tokenizer_path", None) or yaml_cfg.get("tokenizer_path", "")
     if getattr(cli_args, "num_iterations", None) is not None:
@@ -1028,8 +1032,10 @@ def cmd_serve(cfg: Dict[str, Any], logger: Logger) -> None:
         logger.error(f"Tokenizer path not found: {tokenizer_path}")
         sys.exit(1)
 
-    host = cfg.get("host", "0.0.0.0")
-    port = cfg.get("port", 8000)
+    host = cfg.get("host") or "0.0.0.0"
+    # Honor the PORT env var when no explicit port is given -- container
+    # platforms (Cloud Run, etc.) inject the port the service must listen on.
+    port = cfg.get("port") or int(os.environ.get("PORT") or 8000)
     max_batch_size = cfg.get("max_batch_size", 32)
 
     logger.info(f"Starting API server on {host}:{port}")

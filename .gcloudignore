@@ -1,0 +1,25 @@
+# Build context for `gcloud run deploy --source .`.
+# NOTE: gcloud falls back to .gitignore when this file is absent, which would
+# drop real_model/ (gitignored) and break the image. This explicit list keeps
+# the model + code and excludes everything else.
+
+.git/
+.github/
+__pycache__/
+*.pyc
+
+# Tests / dev / docs not needed at runtime
+tests/
+docs/
+results/
+*.md
+
+# Scratch training data / logs / local checkpoints
+data/
+data_small/
+checkpoints/
+test_checkpoints/
+*.log
+result.json
+
+# Keep: selfllm/, real_model/, requirements.txt, setup.py, Dockerfile

@@ -16,21 +16,36 @@ The server (`selfllm/serving/server.py`) implements the OpenAI protocol:
 | GET | `/v1/models` | Bearer |
 | GET | `/health` | open |
 
-Run it (Docker; a trained model dir like the handed-off `real_model/` is mounted):
+The trained model (the handed-off `real_model/`) is **baked into the image**, so
+put it at `./real_model` before building.
+
+**Local Docker:**
 
 ```bash
 docker build -t selfllm-server .
-docker run -p 8000:8000 \
-  -e SELFLLM_API_KEY=sk-pick-a-secret \
-  -e MODEL_PATH=/models/final \
-  -e TOKENIZER_PATH=/models/tokenizer.json \
-  -v /path/to/real_model:/models \
-  selfllm-server
+docker run -p 8000:8000 -e SELFLLM_API_KEY=sk-pick-a-secret selfllm-server
 ```
 
+**Google Cloud Run** (recommended — managed containers, scale-to-zero, HTTPS URL):
+
+```bash
+gcloud auth login
+gcloud config set project YOUR_PROJECT
+gcloud services enable run.googleapis.com cloudbuild.googleapis.com
+# trained model present at ./real_model
+SELFLLM_API_KEY=sk-pick-a-secret REGION=us-central1 ./deploy/cloudrun/deploy.sh
+```
+
+`deploy/cloudrun/deploy.sh` builds from the Dockerfile via Cloud Build
+(`--source .`, no local Docker needed; `.gcloudignore` keeps `real_model/` in
+the upload) and deploys with `--allow-unauthenticated` + `--memory 2Gi --cpu 2
+--timeout 300`. The service is **public but gated by your Bearer key** (Cloud
+Run IAM is off; `SELFLLM_API_KEY` is the auth). The script prints the HTTPS
+service URL — that's your provider **base URL** (append `/v1`). The server
+listens on Cloud Run's injected `$PORT` automatically.
+
 When `SELFLLM_API_KEY` is set, the `/v1/*` inference endpoints require
-`Authorization: Bearer <key>`. Put it behind TLS (a reverse proxy / your host
-platform) to get the public **base URL** you'll register.
+`Authorization: Bearer <key>`.
 
 ## 2. Provider details to register
 
