@@ -47,6 +47,9 @@ class ChatCompletionRequest(BaseModel):
     top_p: float = Field(default=1.0, ge=0.0, le=1.0)
     stream: bool = False
     stop: Optional[List[str]] = None
+    # Opt-in test-time-compute reasoning. e.g.
+    # {"strategy": "self_consistency", "num_samples": 8, "answer_type": "free"}.
+    reasoning: Optional[Dict[str, Any]] = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -128,6 +131,26 @@ async def chat_completions(request: ChatCompletionRequest):
     # Convert messages to prompt string
     prompt = _messages_to_prompt(request.messages)
     prompt_tokens = _tokenizer.encode(prompt)
+
+    # Opt-in reasoning (test-time compute): bypass plain decoding and run a
+    # reasoning strategy, returning its answer. Non-streaming.
+    if request.reasoning:
+        content = _run_reasoning(prompt, request.reasoning)
+        return ChatCompletionResponse(
+            id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+            created=int(time.time()),
+            model=request.model,
+            choices=[{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }],
+            usage={
+                "prompt_tokens": len(prompt_tokens),
+                "completion_tokens": len(_tokenizer.encode(content)),
+                "total_tokens": len(prompt_tokens) + len(_tokenizer.encode(content)),
+            },
+        )
 
     if request.stream:
         return StreamingResponse(
@@ -391,6 +414,47 @@ def _first_stop_index(text: str, stop_sequences: List[str]) -> Optional[int]:
         if idx != -1 and (best is None or idx < best):
             best = idx
     return best
+
+
+def _run_reasoning(prompt: str, opts: Dict[str, Any]) -> str:
+    """Apply a test-time-compute reasoning strategy to ``prompt``.
+
+    ``opts`` selects the strategy and its parameters, e.g.
+    ``{"strategy": "self_consistency", "num_samples": 8, "answer_type": "free"}``.
+    Returns the strategy's answer (falling back to its best trace, then the raw
+    decode) so the endpoint always yields content.
+    """
+    from selfllm.reasoning import (
+        BestOfNStrategy,
+        CoTStrategy,
+        SelfConsistencyStrategy,
+        SelfConsistencyVerifier,
+    )
+
+    device = str(next(_model.parameters()).device)
+    name = (opts.get("strategy") or "self_consistency").lower()
+    answer_type = opts.get("answer_type", "free")
+    num_samples = int(opts.get("num_samples", 5))
+    common = dict(answer_type=answer_type, device=device,
+                  max_think_tokens=int(opts.get("max_new_tokens", 64)),
+                  max_answer_tokens=32)
+
+    if name in ("cot", "chain_of_thought"):
+        strategy = CoTStrategy(_model, _tokenizer, **common)
+    elif name in ("best_of_n", "bon"):
+        strategy = BestOfNStrategy(
+            _model, _tokenizer, SelfConsistencyVerifier(),
+            num_samples=num_samples, **common)
+    else:  # default: self-consistency
+        strategy = SelfConsistencyStrategy(
+            _model, _tokenizer, num_samples=num_samples, **common)
+
+    result = strategy.solve(prompt)
+    if result.answer:
+        return result.answer
+    if result.traces:
+        return result.traces[0]
+    return ""
 
 
 async def _generate_via_scheduler(

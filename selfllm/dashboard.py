@@ -205,6 +205,34 @@ def _get_loss_plot_data(
     return iterations, losses
 
 
+def _handle_metrics_report(metrics_path: str):
+    """Load a ``metrics_history.json`` and render a report + table.
+
+    Surfaces the per-iteration core metrics and any benchmark scores recorded
+    by the recursive loop's eval-suite hook (``benchmark_<name>`` keys).
+
+    Returns ``(markdown_report, dataframe_rows)``.
+    """
+    from selfllm.recursive.report import (
+        format_metrics_report,
+        load_metrics,
+        metrics_table_rows,
+    )
+
+    path = (metrics_path or "").strip()
+    if not path:
+        return "_Enter the path to a `metrics_history.json` file and click Load._", []
+    if not os.path.exists(path):
+        return f"_File not found: `{path}`_", []
+    try:
+        history = load_metrics(path)
+    except Exception as exc:  # noqa: BLE001
+        return f"_Failed to load metrics: {exc}_", []
+    if not history:
+        return "_No iterations recorded in this metrics file._", []
+    return format_metrics_report(history), metrics_table_rows(history)
+
+
 def _handle_training_start(
     corpus_dir: str,
     num_epochs: int,
@@ -313,6 +341,8 @@ def create_dashboard(
     - **Self-Improve**: Start/stop recursive loop, watch live metrics.
     - **Training**: Pre-train on corpus with live loss curves.
     - **Evaluation**: Run eval suite, view results.
+    - **Metrics Report**: Load a metrics_history.json and view per-iteration
+      core metrics + benchmark scores (MMLU/GSM8K/HumanEval).
     - **Settings**: Model config editor.
 
     Args:
@@ -542,6 +572,34 @@ def create_dashboard(
                     fn=_handle_evaluation,
                     inputs=state,
                     outputs=ev_output,
+                )
+
+            # ==================== Metrics Report Tab ====================
+            with gr.TabItem("Metrics Report"):
+                gr.Markdown(
+                    "### Recursive Self-Improvement Metrics\n"
+                    "Load a `metrics_history.json` produced by the recursive "
+                    "loop. Benchmark scores (MMLU / GSM8K / HumanEval) recorded "
+                    "by the eval-suite hook are surfaced automatically."
+                )
+                with gr.Row():
+                    mr_path = gr.Textbox(
+                        label="Path to metrics_history.json",
+                        value=os.path.join(checkpoint_dir, "metrics_history.json"),
+                        scale=4,
+                    )
+                    mr_load_btn = gr.Button("Load", variant="primary", scale=1)
+                mr_report = gr.Markdown(label="Report")
+                mr_table = gr.Dataframe(
+                    label="Per-iteration metrics (incl. benchmarks)",
+                    interactive=False,
+                    wrap=True,
+                )
+
+                mr_load_btn.click(
+                    fn=_handle_metrics_report,
+                    inputs=mr_path,
+                    outputs=[mr_report, mr_table],
                 )
 
             # ==================== Settings Tab ====================

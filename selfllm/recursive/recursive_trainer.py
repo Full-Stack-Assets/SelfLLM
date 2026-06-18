@@ -267,6 +267,11 @@ class RecursiveSelfTrainer:
         if getattr(self.config, "use_constitutional", False):
             self._run_constitutional_step()
 
+        # Optional reasoning self-distillation: fine-tune on the model's own
+        # high-confidence self-consistent reasoning traces. Guarded.
+        if getattr(self.config, "use_reasoning_distillation", False):
+            self._run_reasoning_distillation_step()
+
         # Step 5: Evaluate
         print(f"[Step 5/7] Running evaluation suite ...")
         eval_metrics = self.evaluator.full_evaluation()
@@ -674,6 +679,19 @@ class RecursiveSelfTrainer:
             print(f"    Quality:    {quality_change:+.4f} "
                   f"({first['quality_score']:.4f} -> {last['quality_score']:.4f})")
 
+            # Surface any eval-suite benchmark trajectories recorded by the hook.
+            from .report import detect_benchmark_keys, summarize_metrics
+
+            benchmark_keys = detect_benchmark_keys(self.metrics_history)
+            if benchmark_keys:
+                summary = summarize_metrics(self.metrics_history)
+                print(f"\n  Benchmarks (first -> last):")
+                for key in benchmark_keys:
+                    if key in summary:
+                        s = summary[key]
+                        print(f"    {key[len('benchmark_'):]}: "
+                              f"{s['first']:.4f} -> {s['last']:.4f} ({s['delta']:+.4f})")
+
         print(f"\n  Metrics saved to: "
               f"{os.path.join(self.config.checkpoint_dir, 'metrics_history.json')}")
         print(f"{'#' * 60}\n")
@@ -801,6 +819,66 @@ class RecursiveSelfTrainer:
             print(f"  ⚠️  Benchmark hook failed ({type(e).__name__}: {e}); skipping.")
 
         return scores
+
+    def _run_reasoning_distillation_step(self) -> None:
+        """Fine-tune on the model's own high-confidence reasoning traces.
+
+        Runs self-consistency over the eval prompts; for each prompt whose
+        consensus confidence clears ``distillation_confidence``, keeps the
+        winning reasoning trace and fine-tunes (LM objective) on it. This
+        distills the model toward its own best reasoning. Guarded so any
+        failure degrades gracefully.
+        """
+        try:
+            from ..reasoning import SelfConsistencyStrategy
+            from ..reasoning.extract import normalize
+            from ..training.dataset import SelfTrainingDataset
+
+            print("[Step 4d] Reasoning self-distillation ...")
+            strategy = SelfConsistencyStrategy(
+                self.model, self.tokenizer, answer_type="free", device=self.device,
+                num_samples=self.config.distillation_num_samples,
+                temperature=self.config.generation_temperature,
+                top_p=self.config.generation_top_p,
+                max_think_tokens=self.config.distillation_max_new_tokens,
+                max_answer_tokens=32,
+            )
+            samples = []
+            for question in self.config.eval_prompts:
+                result = strategy.solve(question)
+                if (
+                    result.answer is not None
+                    and result.confidence >= self.config.distillation_confidence
+                    and result.traces
+                ):
+                    # Use a trace that produced the winning (consensus) answer.
+                    win = normalize(result.answer)
+                    answers = result.details.get("answers", [])
+                    idx = next(
+                        (i for i, a in enumerate(answers) if normalize(a) == win), 0
+                    )
+                    # Train (LM objective) on the full reasoning trace.
+                    samples.append({"prompt": "", "response": result.traces[idx]})
+
+            if not samples:
+                print("  No high-confidence reasoning traces; skipping.")
+                return
+
+            max_seq = getattr(getattr(self.model, "config", None), "max_seq_len", 512)
+            dataset = SelfTrainingDataset(
+                samples=samples, tokenizer=self.tokenizer, max_seq_len=max_seq,
+            )
+            loss = self.train_step(
+                dataset,
+                num_epochs=1,
+                learning_rate=self.config.learning_rate,
+                batch_size=self.config.batch_size,
+                gradient_accumulation_steps=1,
+            )
+            print(f"  Distilled {len(samples)} reasoning traces, loss={loss:.4f}")
+        except Exception as e:  # pragma: no cover - defensive guard
+            print(f"  ⚠️  Reasoning distillation failed "
+                  f"({type(e).__name__}: {e}); continuing.")
 
     def _save_metrics_history(self) -> None:
         """Persist the full metrics history to JSON in the checkpoint dir."""
