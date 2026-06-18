@@ -240,10 +240,15 @@ class MoELayer(nn.Module):
             token_indices = token_k_pairs[:, 0]  # [num_assignments]
             k_positions = token_k_pairs[:, 1]  # [num_assignments]
 
-            # Capacity truncation: keep only the first `capacity` tokens
+            # Capacity truncation: keep the highest-gated assignments rather
+            # than the first `capacity` by token index. Slicing by index drops
+            # whichever tokens appear later in the sequence, biasing the model
+            # against later positions; prioritizing by router weight is unbiased.
             if token_indices.shape[0] > capacity:
-                token_indices = token_indices[:capacity]
-                k_positions = k_positions[:capacity]
+                assign_weights = expert_weights[token_indices, k_positions]
+                keep = torch.topk(assign_weights, capacity).indices
+                token_indices = token_indices[keep]
+                k_positions = k_positions[keep]
 
             # Gather input tokens for this expert
             expert_input = x_flat[token_indices]  # [num_assigned, D]

@@ -309,6 +309,18 @@ class PPOTrainer:
         # Reward at the last generated position for each sequence
         per_token_rewards[:, -1] = rewards_seq
 
+        # Response mask in the [B, T-1] log-prob space.
+        # log-prob index t scores the target token sequences[:, t+1]. The first
+        # *generated* token is sequences[:, prompt_len], which corresponds to
+        # log-prob index prompt_len - 1. So response positions are indices
+        # >= prompt_len - 1; all earlier indices score prompt tokens and must
+        # be masked out so they never contribute to any loss term.
+        num_lp = policy_log_probs.shape[1]  # T - 1
+        response_start = max(prompt_len - 1, 0)
+        response_mask = torch.zeros_like(policy_log_probs)
+        if response_start < num_lp:
+            response_mask[:, response_start:] = 1.0
+
         return {
             "sequences": sequences,
             "prompt_len": prompt_len,
@@ -317,6 +329,7 @@ class PPOTrainer:
             "values": values,  # [B, T-1]
             "rewards": per_token_rewards,  # [B, T-1] (sparse)
             "rewards_seq": rewards_seq,  # [B]
+            "response_mask": response_mask,  # [B, T-1]
         }
 
     # ------------------------------------------------------------------ #
@@ -336,6 +349,12 @@ class PPOTrainer:
 
         where delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)
 
+        Fully vectorized over the batch and time dimensions: the reverse
+        recurrence is unrolled with a Python loop over time steps only,
+        operating on whole ``[batch]`` slices at once (no per-element
+        ``.item()`` calls), which is both faster and far more memory
+        efficient for long sequences.
+
         Args:
             rewards: Per-token rewards ``[batch, seq_len]``.
             values: Per-token value estimates ``[batch, seq_len]``.
@@ -347,30 +366,25 @@ class PPOTrainer:
                 - returns: ``[batch, seq_len]`` — TD(lambda) returns
         """
         batch_size, seq_len = rewards.shape
-        device = rewards.device
 
         advantages = torch.zeros_like(rewards)
-        returns = torch.zeros_like(rewards)
 
-        # Compute GAE for each sequence in the batch
-        for b in range(batch_size):
-            last_gae = 0.0
-            # Iterate backwards through the sequence
-            for t in reversed(range(seq_len)):
-                if t == seq_len - 1:
-                    # Terminal state: V(s_{t+1}) = 0
-                    next_value = 0.0
-                else:
-                    next_value = values[b, t + 1].item()
+        # V(s_{t+1}) for each position; terminal state has next value 0.
+        next_values = torch.zeros_like(values)
+        if seq_len > 1:
+            next_values[:, :-1] = values[:, 1:]
 
-                # TD error
-                delta = rewards[b, t].item() + self.gamma * next_value - values[b, t].item()
+        # TD errors for all positions at once: delta_t = r_t + gamma*V(s_{t+1}) - V(s_t)
+        deltas = rewards + self.gamma * next_values - values  # [B, T]
 
-                # GAE accumulator
-                last_gae = delta + self.gamma * self.lam * last_gae
+        # Reverse cumulative GAE: loop over the time dimension only,
+        # processing the whole batch as a vector at each step.
+        last_gae = torch.zeros(batch_size, dtype=rewards.dtype, device=rewards.device)
+        for t in reversed(range(seq_len)):
+            last_gae = deltas[:, t] + self.gamma * self.lam * last_gae
+            advantages[:, t] = last_gae
 
-                advantages[b, t] = last_gae
-                returns[b, t] = advantages[b, t] + values[b, t]
+        returns = advantages + values
 
         return advantages, returns
 
@@ -386,8 +400,14 @@ class PPOTrainer:
         advantages: torch.Tensor,
         values: torch.Tensor,
         returns: torch.Tensor,
+        response_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Compute PPO clipped loss with KL penalty and value loss.
+
+        Only the generated/response tokens contribute to every loss term.
+        Prompt positions are excluded via ``response_mask`` (1.0 for response
+        tokens, 0.0 for prompt/padding positions). When no mask is supplied,
+        all positions are treated as response tokens.
 
         Args:
             policy_log_probs: Current policy log-probs ``[batch, seq_len]``.
@@ -396,14 +416,25 @@ class PPOTrainer:
             advantages: GAE advantages ``[batch, seq_len]``.
             values: Current value estimates ``[batch, seq_len]``.
             returns: TD(lambda) returns ``[batch, seq_len]``.
+            response_mask: Optional ``[batch, seq_len]`` mask; 1.0 marks
+                response tokens that should contribute to the losses, 0.0
+                masks out prompt/padding positions.
 
         Returns:
             Dict with:
                 - ``policy_loss``: Clipped PPO policy loss (scalar)
                 - ``value_loss``: MSE value loss (scalar)
-                - ``kl_div``: Mean KL divergence (scalar)
+                - ``kl_div``: Mean KL divergence over response tokens (scalar)
                 - ``total_loss``: Combined loss (scalar)
         """
+        if response_mask is None:
+            mask = torch.ones_like(policy_log_probs)
+        else:
+            mask = response_mask.to(dtype=policy_log_probs.dtype)
+
+        # Number of contributing (response) tokens, used for masked means.
+        mask_sum = mask.sum().clamp(min=1.0)
+
         # Log-prob ratio: pi_theta(a_t) / pi_theta_old(a_t)
         log_ratio = policy_log_probs - old_log_probs  # [B, T]
         ratio = torch.exp(log_ratio)  # [B, T]
@@ -412,15 +443,22 @@ class PPOTrainer:
         surr1 = ratio * advantages  # [B, T]
         surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * advantages
 
-        # Clipped policy loss (negative because we maximize)
-        policy_loss = -torch.min(surr1, surr2).mean()
+        # Clipped policy loss (negative because we maximize), masked to
+        # response tokens only.
+        policy_loss_per_token = -torch.min(surr1, surr2)  # [B, T]
+        policy_loss = (policy_loss_per_token * mask).sum() / mask_sum
 
-        # Value loss: MSE between predicted values and returns
-        value_loss = F.mse_loss(values, returns)
+        # Value loss: masked MSE between predicted values and returns.
+        value_loss_per_token = (values - returns) ** 2  # [B, T]
+        value_loss = (value_loss_per_token * mask).sum() / mask_sum
 
-        # KL divergence from reference model (per-token)
-        kl_div_per_token = policy_log_probs - ref_log_probs  # [B, T]
-        kl_div = kl_div_per_token.mean()
+        # KL divergence from reference model (per-token), using the
+        # non-negative k3 estimator:
+        #   kl = exp(ref_lp - policy_lp) - (ref_lp - policy_lp) - 1  (>= 0)
+        # Computed only over response tokens via the mask.
+        ref_minus_policy = ref_log_probs - policy_log_probs  # [B, T]
+        kl_div_per_token = torch.exp(ref_minus_policy) - ref_minus_policy - 1.0  # [B, T]
+        kl_div = (kl_div_per_token * mask).sum() / mask_sum
 
         # KL penalty: encourage staying close to reference
         kl_penalty = self.kl_coeff * kl_div
@@ -475,15 +513,26 @@ class PPOTrainer:
         old_values = rollout["values"].detach()
         rewards = rollout["rewards"].detach()
         rewards_seq = rollout["rewards_seq"].detach()
+        response_mask = rollout["response_mask"].detach()
 
         # ---- Phase 2: Compute GAE advantages ----
         advantages, returns = self._compute_gae(
             rewards, old_values, old_policy_log_probs
         )
 
-        # Normalize advantages for training stability
-        if advantages.numel() > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # Zero out prompt positions so they never contribute to the update.
+        advantages = advantages * response_mask
+        returns = returns * response_mask
+
+        # Normalize advantages for training stability over response tokens only.
+        mask_count = response_mask.sum()
+        if mask_count > 1:
+            adv_mean = (advantages * response_mask).sum() / mask_count
+            adv_var = ((advantages - adv_mean) ** 2 * response_mask).sum() / mask_count
+            adv_std = adv_var.clamp(min=0.0).sqrt()
+            advantages = (advantages - adv_mean) / (adv_std + 1e-8)
+            # Re-mask so prompt positions stay exactly zero.
+            advantages = advantages * response_mask
 
         # ---- Phase 3: PPO update epochs ----
         total_metrics: Dict[str, float] = {
@@ -512,7 +561,7 @@ class PPOTrainer:
             self.value_model.train()
             current_values = self.value_model(sequences)[:, :-1]  # [B, T-1]
 
-            # Compute PPO loss
+            # Compute PPO loss (response tokens only)
             loss_dict = self._compute_ppo_loss(
                 policy_log_probs=policy_log_probs,
                 old_log_probs=old_policy_log_probs,
@@ -520,6 +569,7 @@ class PPOTrainer:
                 advantages=advantages,
                 values=current_values,
                 returns=returns,
+                response_mask=response_mask,
             )
 
             # Update policy

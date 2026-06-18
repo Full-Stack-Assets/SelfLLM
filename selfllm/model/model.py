@@ -30,6 +30,24 @@ def _create_causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
     )
 
 
+def _create_sliding_window_mask(
+    seq_len: int, device: torch.device, window: int, sinks: int = 0
+) -> torch.Tensor:
+    """Causal mask restricted to a sliding window plus optional attention sinks.
+
+    A query at position ``i`` attends to keys ``j`` where ``j <= i`` and
+    ``j > i - window``; additionally the first ``sinks`` tokens are always
+    attendable. Returns a boolean mask where ``True`` means "masked out".
+    """
+    i = torch.arange(seq_len, device=device).unsqueeze(1)  # [S, 1] query
+    j = torch.arange(seq_len, device=device).unsqueeze(0)  # [1, S] key
+    masked = (j > i) | (j <= i - window)
+    if sinks > 0:
+        keep_sink = (j < sinks) & (j <= i)  # sink tokens, still causal
+        masked = masked & ~keep_sink
+    return masked
+
+
 class SelfImprovingLLM(nn.Module):
     """Complete transformer language model for recursive self-improvement.
 
@@ -133,7 +151,16 @@ class SelfImprovingLLM(nn.Module):
         # Causal mask only for the non-cached (prefill / full) path. During
         # cached decoding the attention layer builds the correct
         # ``[q_len, kv_len]`` mask from the cache length, so leave it ``None``.
-        mask = None if past_key_values is not None else _create_causal_mask(seq_len, device)
+        if past_key_values is not None:
+            mask = None
+        elif getattr(self.config, "sliding_window", None):
+            # Long-context: restrict attention to a sliding window + sinks.
+            mask = _create_sliding_window_mask(
+                seq_len, device, self.config.sliding_window,
+                getattr(self.config, "attention_sinks", 0),
+            )
+        else:
+            mask = _create_causal_mask(seq_len, device)
 
         # Transformer blocks
         new_caches: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = (

@@ -39,6 +39,10 @@ class RecursiveConfig:
     dpo_beta: float = 0.1
     dpo_epochs: int = 1
 
+    # Constitutional AI: generate (initial, revised) preference pairs via
+    # self-critique and align toward the revised responses with DPO.
+    use_constitutional: bool = False
+
     # Experience Replay
     replay_buffer_size: int = 10000
     replay_ratio: float = 0.3  # % of training from past iterations

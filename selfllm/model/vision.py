@@ -136,9 +136,19 @@ class VisionEncoder(nn.Module):
         x = x + self.pos_embed
         x = self.dropout(x)
 
+        # Image patches must attend BIDIRECTIONALLY: every patch (and the CLS
+        # token) may attend to every other patch. The shared TransformerBlock
+        # applies *causal* masking by default, so we pass an explicit all-False
+        # mask (no position masked) to disable causal masking and obtain full
+        # bidirectional attention over the patch sequence.
+        seq_len = x.shape[1]
+        full_mask = torch.zeros(
+            seq_len, seq_len, device=x.device, dtype=torch.bool
+        )
+
         # Pass through ViT transformer blocks
         for block in self.blocks:
-            x = block(x)
+            x = block(x, mask=full_mask)
 
         x = self.norm(x)
 
@@ -202,6 +212,65 @@ class MultimodalLLM(nn.Module):
             )
 
     # ------------------------------------------------------------------ #
+    # Mask / embedding helpers
+    # ------------------------------------------------------------------ #
+
+    def _marker_embeds(self, batch_size: int, device: torch.device) -> tuple:
+        """Return (start, end) image marker embeddings ``[B, 1, D]`` each.
+
+        The ``image_start_token_id`` / ``image_end_token_id`` live *outside* the
+        base vocabulary, so they have no row in the LLM's embedding table. We
+        derive learnable-free marker embeddings deterministically from the LLM's
+        existing embedding weights (mean of the table, offset per marker) so the
+        markers are meaningful and reproducible without changing the embedding
+        table's shape.
+        """
+        weight = self.llm.token_embedding.weight  # [vocab, D]
+        base = weight.mean(dim=0)  # [D]
+        start = (base + weight.std(dim=0)).to(device)
+        end = (base - weight.std(dim=0)).to(device)
+        start = start.view(1, 1, -1).expand(batch_size, 1, -1)
+        end = end.view(1, 1, -1).expand(batch_size, 1, -1)
+        return start, end
+
+    @staticmethod
+    def _build_multimodal_mask(
+        num_image_tokens: int,
+        text_seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Build a block-wise attention mask for ``[image_region, text]``.
+
+        Convention (matches the attention layers): ``True`` == masked out.
+
+        - Image-region positions (markers + patches) attend to *all* image-region
+          positions bidirectionally, and to nothing in the text region.
+        - Text positions attend causally to earlier text positions and to *all*
+          image-region positions.
+
+        Returns:
+            Boolean mask ``[total_len, total_len]`` where ``total_len ==
+            num_image_tokens + text_seq_len``.
+        """
+        total = num_image_tokens + text_seq_len
+        # Start fully masked, then open up the allowed blocks.
+        mask = torch.ones(total, total, device=device, dtype=torch.bool)
+
+        if num_image_tokens > 0:
+            # Image region attends bidirectionally to the whole image region.
+            mask[:num_image_tokens, :num_image_tokens] = False
+            # Text attends to all image-region positions.
+            mask[num_image_tokens:, :num_image_tokens] = False
+
+        # Text attends causally to text (lower-triangular incl. diagonal).
+        text_causal = torch.triu(
+            torch.ones(text_seq_len, text_seq_len, device=device, dtype=torch.bool),
+            diagonal=1,
+        )
+        mask[num_image_tokens:, num_image_tokens:] = text_causal
+        return mask
+
+    # ------------------------------------------------------------------ #
     # Forward
     # ------------------------------------------------------------------ #
 
@@ -239,21 +308,25 @@ class MultimodalLLM(nn.Module):
             # Get image patch embeddings
             image_embeds = self.vision(images)  # [B, num_patches, D]
 
-            # Concatenate: [image_patches, text_tokens]
-            combined_embeds = torch.cat([image_embeds, text_embeds], dim=1)
-            num_image_tokens = image_embeds.shape[1]
+            # Delimit the image region with start/end marker embeddings so the
+            # image embedding region is explicitly bounded in the sequence.
+            start_embed, end_embed = self._marker_embeds(batch_size, device)
+
+            # Concatenate: [<img_start>, image_patches, <img_end>, text_tokens]
+            combined_embeds = torch.cat(
+                [start_embed, image_embeds, end_embed, text_embeds], dim=1
+            )
+            # The image region spans the start marker, all patches and the end
+            # marker (markers attend bidirectionally with the patches).
+            num_image_tokens = image_embeds.shape[1] + 2
         else:
             combined_embeds = text_embeds
             num_image_tokens = 0
 
-        combined_seq_len = combined_embeds.shape[1]
-
-        # Build causal mask for the combined sequence
-        mask = torch.triu(
-            torch.ones(
-                combined_seq_len, combined_seq_len, device=device, dtype=torch.bool
-            ),
-            diagonal=1,
+        # Build a block-wise mask: image region attends bidirectionally, text
+        # attends causally to text and to all image-region positions.
+        mask = self._build_multimodal_mask(
+            num_image_tokens, text_seq_len, device
         )
 
         # Pass through LLM transformer blocks
@@ -297,6 +370,7 @@ class MultimodalLLM(nn.Module):
         top_k: int = 50,
         top_p: float = 0.95,
         prompt_token_ids: Optional[torch.Tensor] = None,
+        eos_token_id: int = 1,
     ) -> str:
         """Generate a caption for an image.
 
@@ -312,6 +386,8 @@ class MultimodalLLM(nn.Module):
             prompt_token_ids: Optional prompt token IDs to prepend to the
                 generation. If not provided, a default "caption:" prompt
                 is used (as raw token IDs from the base vocab).
+            eos_token_id: Token ID that terminates generation early when
+                sampled (default: ``1``, the ``<eos>`` token).
 
         Returns:
             Generated caption string (token IDs space-joined if no tokenizer
@@ -327,8 +403,11 @@ class MultimodalLLM(nn.Module):
         batch_size = image.shape[0]
         device = image.device
 
-        # Encode image -> patch embeddings (done once)
+        # Encode image -> patch embeddings (done once), wrapped in start/end
+        # marker embeddings that delimit the image region.
         image_embeds = self.vision(image)  # [B, num_patches, D]
+        start_embed, end_embed = self._marker_embeds(batch_size, device)
+        image_embeds = torch.cat([start_embed, image_embeds, end_embed], dim=1)
         num_image_tokens = image_embeds.shape[1]
 
         # Prepare text prompt — must use valid in-vocab token IDs
@@ -352,19 +431,16 @@ class MultimodalLLM(nn.Module):
         # Get text embeddings for the prompt
         text_embeds = self.llm.token_embedding(prompt_token_ids)  # [B, T_prompt, D]
 
-        # Initial combined sequence: [image_patches, prompt_tokens]
+        # Initial combined sequence: [image_region, prompt_tokens]
         combined_embeds = torch.cat([image_embeds, text_embeds], dim=1)
         generated_token_ids = prompt_token_ids.clone()
 
         for _step in range(max_length):
-            combined_seq_len = combined_embeds.shape[1]
+            text_seq_len = combined_embeds.shape[1] - num_image_tokens
 
-            # Causal mask
-            mask = torch.triu(
-                torch.ones(
-                    combined_seq_len, combined_seq_len, device=device, dtype=torch.bool
-                ),
-                diagonal=1,
+            # Block-wise mask: image region bidirectional, text causal + image.
+            mask = self._build_multimodal_mask(
+                num_image_tokens, text_seq_len, device
             )
 
             # Forward through LLM blocks
@@ -416,6 +492,11 @@ class MultimodalLLM(nn.Module):
             next_embed = self.llm.token_embedding(next_token)  # [B, 1, D]
             combined_embeds = torch.cat([combined_embeds, next_embed], dim=1)
 
+            # EOS early termination: stop once every sequence in the batch has
+            # emitted the EOS token (here batch is 1 for generation).
+            if (next_token == eos_token_id).all():
+                break
+
         # Return as space-joined token IDs (caller can decode with tokenizer)
         token_list = generated_token_ids[0].cpu().tolist()
         return " ".join(str(t) for t in token_list)
@@ -429,6 +510,7 @@ class MultimodalLLM(nn.Module):
         temperature: float = 1.0,
         top_k: int = 50,
         top_p: float = 0.95,
+        eos_token_id: int = 1,
     ) -> str:
         """Answer a question about an image.
 
@@ -443,6 +525,8 @@ class MultimodalLLM(nn.Module):
             temperature: Sampling temperature.
             top_k: Top-k filtering parameter.
             top_p: Nucleus (top-p) filtering parameter.
+            eos_token_id: Token ID that terminates generation early when
+                sampled (default: ``1``, the ``<eos>`` token).
 
         Returns:
             Generated answer string (space-joined token IDs).
@@ -455,25 +539,28 @@ class MultimodalLLM(nn.Module):
         if question_token_ids.dim() == 1:
             question_token_ids = question_token_ids.unsqueeze(0)  # [1, T_q]
 
-        # Encode image
+        batch_size = image.shape[0]
+        device = image.device
+
+        # Encode image, wrapped in start/end marker embeddings.
         image_embeds = self.vision(image)  # [B, num_patches, D]
+        start_embed, end_embed = self._marker_embeds(batch_size, device)
+        image_embeds = torch.cat([start_embed, image_embeds, end_embed], dim=1)
+        num_image_tokens = image_embeds.shape[1]
 
         # Get question embeddings
         question_embeds = self.llm.token_embedding(question_token_ids)  # [B, T_q, D]
 
-        # Combined: [image_patches, question_tokens]
+        # Combined: [image_region, question_tokens]
         combined_embeds = torch.cat([image_embeds, question_embeds], dim=1)
         generated_token_ids = question_token_ids.clone()
 
         for _step in range(max_length):
-            combined_seq_len = combined_embeds.shape[1]
+            text_seq_len = combined_embeds.shape[1] - num_image_tokens
 
-            # Causal mask
-            mask = torch.triu(
-                torch.ones(
-                    combined_seq_len, combined_seq_len, device=image.device, dtype=torch.bool
-                ),
-                diagonal=1,
+            # Block-wise mask: image region bidirectional, text causal + image.
+            mask = self._build_multimodal_mask(
+                num_image_tokens, text_seq_len, device
             )
 
             # Forward through LLM blocks
@@ -519,6 +606,10 @@ class MultimodalLLM(nn.Module):
 
             next_embed = self.llm.token_embedding(next_token)
             combined_embeds = torch.cat([combined_embeds, next_embed], dim=1)
+
+            # EOS early termination.
+            if (next_token == eos_token_id).all():
+                break
 
         token_list = generated_token_ids[0].cpu().tolist()
         return " ".join(str(t) for t in token_list)

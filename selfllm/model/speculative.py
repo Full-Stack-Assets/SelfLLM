@@ -97,6 +97,7 @@ class SpeculativeDecoder:
         max_new_tokens: int = 128,
         temperature: float = 1.0,
         top_p: float = 1.0,
+        eos_token_id: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Speculative generation.
@@ -111,11 +112,15 @@ class SpeculativeDecoder:
            residual distribution and continue.
         5. If all *gamma* are accepted, keep them and repeat.
 
+        Each sequence in the batch is decoded independently (acceptance counts
+        differ per row), then the results are right-padded to a common length.
+
         Args:
             prompt_ids: Prompt token IDs ``[batch, prompt_len]``.
             max_new_tokens: Maximum number of new tokens to generate.
             temperature: Sampling temperature.
             top_p: Nucleus sampling threshold.
+            eos_token_id: If provided, a sequence stops once it emits this token.
 
         Returns:
             Dictionary with ``sequences`` and ``acceptance_rate`` keys.
@@ -123,10 +128,50 @@ class SpeculativeDecoder:
         self.draft_model.eval()
         self.target_model.eval()
 
-        generated = prompt_ids.clone()  # [batch, seq_len]
-        num_generated = 0
+        batch = prompt_ids.shape[0]
+        rows = [
+            self._generate_single(
+                prompt_ids[b : b + 1],
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                eos_token_id=eos_token_id,
+            )
+            for b in range(batch)
+        ]
+        max_len = max(r.shape[1] for r in rows)
+        pad_id = eos_token_id if eos_token_id is not None else 0
+        padded = [
+            F.pad(r, (0, max_len - r.shape[1]), value=pad_id) if r.shape[1] < max_len else r
+            for r in rows
+        ]
+        generated = torch.cat(padded, dim=0)
 
-        while num_generated < max_new_tokens:
+        return {
+            "sequences": generated,
+            "acceptance_rate": torch.tensor(
+                self.acceptance_rate, device=self.device
+            ),
+        }
+
+    @torch.no_grad()
+    def _generate_single(
+        self,
+        prompt_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        eos_token_id: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Speculative-decode a single sequence ``[1, prompt_len]``.
+
+        Returns the full sequence ``[1, prompt_len + generated_len]``.
+        """
+        generated = prompt_ids.clone()  # [1, seq_len]
+        num_generated = 0
+        stop = False
+
+        while num_generated < max_new_tokens and not stop:
             # ---- 1. Draft model generates gamma tokens ----
             draft_tokens = self._draft_generate(
                 generated, gamma=self.gamma, temperature=temperature, top_p=top_p
@@ -211,6 +256,15 @@ class SpeculativeDecoder:
                         rejected = True
                         break
 
+            # Stop at EOS: truncate the accepted run at the first EOS token.
+            if eos_token_id is not None and eos_token_id in accepted:
+                accepted = accepted[: accepted.index(eos_token_id) + 1]
+                stop = True
+
+            # Don't exceed the requested budget.
+            if num_generated + len(accepted) > max_new_tokens:
+                accepted = accepted[: max_new_tokens - num_generated]
+
             # Append accepted tokens to the generated sequence
             if accepted:
                 accepted_tensor = torch.tensor(
@@ -219,19 +273,10 @@ class SpeculativeDecoder:
                 generated = torch.cat([generated, accepted_tensor], dim=1)
                 num_generated += len(accepted)
 
-            if rejected:
-                # After rejection, continue with standard decoding next iteration
-                pass
-
             if num_generated >= max_new_tokens:
                 break
 
-        return {
-            "sequences": generated,
-            "acceptance_rate": torch.tensor(
-                self.acceptance_rate, device=self.device
-            ),
-        }
+        return generated
 
     # ------------------------------------------------------------------ #
     # Draft helper
@@ -257,11 +302,20 @@ class SpeculativeDecoder:
             Draft token IDs ``[batch, gamma]``.
         """
         draft_tokens: List[torch.Tensor] = []
-        current = prefix.clone()
+
+        # Incremental KV cache: prefill the prefix once, then feed a single
+        # token per step (O(gamma) instead of re-encoding the prefix each step).
+        past: Optional[List] = None
+        next_token: Optional[torch.Tensor] = None
+        total_len = prefix.shape[1]
 
         for _ in range(gamma):
-            # Forward pass
-            out = self.draft_model(current)
+            # Forward pass (cached): prefill on the first step, then one token.
+            model_input = prefix if past is None else next_token
+            out = self.draft_model(
+                model_input, past_key_values=past, use_cache=True
+            )
+            past = out["past_key_values"]
             logits = out["logits"][:, -1, :]  # [batch, vocab]
 
             if temperature == 0.0:
@@ -291,10 +345,10 @@ class SpeculativeDecoder:
                 next_token = torch.multinomial(probs, num_samples=1)
 
             draft_tokens.append(next_token)
-            current = torch.cat([current, next_token], dim=1)
+            total_len += 1
 
             # Prevent exceeding max seq len
-            if current.shape[1] >= self.draft_model.config.max_seq_len:
+            if total_len >= self.draft_model.config.max_seq_len:
                 break
 
         if not draft_tokens:

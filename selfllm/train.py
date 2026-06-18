@@ -145,6 +145,8 @@ def merge_config(yaml_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dict
     merged["data_path"] = getattr(cli_args, "data_path", None) or yaml_cfg.get("data_path", "")
     merged["model_path"] = getattr(cli_args, "model_path", None) or yaml_cfg.get("model_path", "")
     merged["tokenizer_path"] = getattr(cli_args, "tokenizer_path", None) or yaml_cfg.get("tokenizer_path", "")
+    if getattr(cli_args, "num_iterations", None) is not None:
+        merged["num_iterations"] = cli_args.num_iterations
     merged["save_path"] = getattr(cli_args, "save_path", None) or yaml_cfg.get("save_path", "")
     merged["eval_data"] = getattr(cli_args, "eval_data", None) or yaml_cfg.get("eval_data", "")
     merged["prompt"] = getattr(cli_args, "prompt", None) or yaml_cfg.get("prompt", "")
@@ -455,6 +457,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--save-every", type=int, default=None, help="Save a checkpoint every N epochs."
     )
 
+    # ------------------------------------------------------------------
+    # ppo (RLHF)
+    # ------------------------------------------------------------------
+    ppo_parser = subparsers.add_parser(
+        "ppo",
+        help="Run PPO (RLHF) policy updates on a trained model.",
+        description="Optimize a loaded model with PPO using a reward model and GAE.",
+    )
+    ppo_parser.add_argument(
+        "--model-path", type=str, required=True, help="Path to the model checkpoint."
+    )
+    ppo_parser.add_argument(
+        "--tokenizer-path", type=str, required=True, help="Path to the tokenizer."
+    )
+    ppo_parser.add_argument(
+        "--num-iterations", type=int, default=None, help="Number of PPO update iterations."
+    )
+
     return parser
 
 
@@ -654,6 +674,55 @@ def cmd_fsdp_pretrain(cfg: Dict[str, Any], logger: Logger) -> None:
             logger.info(f"FSDP pre-training complete. Checkpoint: {ckpt_path}")
     finally:
         FSDPTrainer.cleanup_process_group()
+
+
+def cmd_ppo(cfg: Dict[str, Any], logger: Logger) -> None:
+    """Run PPO (RLHF) policy updates on a trained model."""
+    import copy
+
+    from selfllm.model.model import SelfImprovingLLM
+    from selfllm.model.tokenizer import BPETokenizer
+    from selfllm.training.ppo_trainer import PPOTrainer, RewardModel
+
+    model_path = cfg.get("model_path", "")
+    tokenizer_path = cfg.get("tokenizer_path", "")
+    if not model_path or not Path(model_path).exists():
+        logger.error(f"Model path not found: {model_path}")
+        sys.exit(1)
+    if not tokenizer_path or not Path(tokenizer_path).exists():
+        logger.error(f"Tokenizer path not found: {tokenizer_path}")
+        sys.exit(1)
+
+    logger.info("Loading model and tokenizer for PPO...")
+    model = SelfImprovingLLM.from_pretrained(model_path).to(cfg["device"])
+    tokenizer = BPETokenizer(vocab_size=cfg["model"].get("vocab_size", 32000))
+    tokenizer.load(tokenizer_path)
+
+    trainer = PPOTrainer(
+        policy_model=model,
+        ref_model=copy.deepcopy(model),
+        reward_model=RewardModel(copy.deepcopy(model)),
+        device=cfg["device"],
+    )
+
+    prompts = cfg.get("recursive", {}).get("eval_prompts") or [
+        "The future of artificial intelligence is",
+        "Once upon a time, in a distant land,",
+        "The most important scientific discovery was",
+    ]
+    num_iterations = cfg.get("num_iterations") or 5
+
+    logger.info(f"Running {num_iterations} PPO iterations on {len(prompts)} prompts...")
+    for it in range(num_iterations):
+        metrics = trainer.train_step_from_text(prompts, tokenizer, max_new_tokens=32)
+        logger.info(
+            f"PPO iter {it + 1}/{num_iterations}: "
+            + ", ".join(f"{k}={v:.4f}" for k, v in metrics.items())
+        )
+
+    out_dir = Path(cfg["checkpoint_dir"]) / "ppo_model"
+    model.save_pretrained(str(out_dir))
+    logger.info(f"PPO complete. Policy model saved to {out_dir}")
 
 
 def cmd_self_improve(cfg: Dict[str, Any], logger: Logger) -> None:
@@ -1017,6 +1086,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "init": cmd_init,
         "pretrain": cmd_pretrain,
         "fsdp-pretrain": cmd_fsdp_pretrain,
+        "ppo": cmd_ppo,
         "self-improve": cmd_self_improve,
         "real-training": cmd_real_training,
         "generate": cmd_generate,

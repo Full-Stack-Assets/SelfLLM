@@ -261,6 +261,12 @@ class RecursiveSelfTrainer:
         if getattr(self.config, "use_dpo", False):
             self._run_dpo_step()
 
+        # Optional Constitutional AI pass: self-critique + revise to build
+        # (initial, revised) preference pairs, then align toward the revised
+        # responses with DPO. Guarded so a failure never aborts the loop.
+        if getattr(self.config, "use_constitutional", False):
+            self._run_constitutional_step()
+
         # Step 5: Evaluate
         print(f"[Step 5/7] Running evaluation suite ...")
         eval_metrics = self.evaluator.full_evaluation()
@@ -698,6 +704,46 @@ class RecursiveSelfTrainer:
             )
         except Exception as e:  # pragma: no cover - defensive guard
             print(f"  ⚠️  DPO step failed ({type(e).__name__}: {e}); continuing.")
+
+    def _run_constitutional_step(self) -> None:
+        """Run a Constitutional AI self-critique + DPO alignment pass.
+
+        Builds (initial, revised) preference pairs via the Constitutional AI
+        critique/revise pipeline and optimizes the policy toward the revised
+        (preferred) responses. Guarded so any failure degrades gracefully.
+        """
+        try:
+            from ..training.constitutional_ai import ConstitutionalAI
+            from ..training.dpo_trainer import DPOTrainer
+
+            print("[Step 4c] Constitutional AI critique + revise ...")
+            cai = ConstitutionalAI(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                device=self.device,
+            )
+            pairs = cai.generate_training_pairs(
+                self.config.eval_prompts,
+                num_pairs=max(2, len(self.config.eval_prompts)),
+            )
+            if not pairs:
+                print("  No constitutional pairs generated; skipping.")
+                return
+            dpo = DPOTrainer(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                beta=self.config.dpo_beta,
+                learning_rate=self.config.learning_rate,
+                batch_size=self.config.batch_size,
+                device=self.device,
+            )
+            metrics = dpo.train_step(pairs, num_epochs=self.config.dpo_epochs)
+            print(
+                f"  Constitutional+DPO: loss={metrics.get('loss', 0.0):.4f}, "
+                f"accuracy={metrics.get('accuracy', 0.0):.4f}"
+            )
+        except Exception as e:  # pragma: no cover - defensive guard
+            print(f"  ⚠️  Constitutional step failed ({type(e).__name__}: {e}); continuing.")
 
     def _save_metrics_history(self) -> None:
         """Persist the full metrics history to JSON in the checkpoint dir."""

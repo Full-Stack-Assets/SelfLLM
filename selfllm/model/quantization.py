@@ -97,6 +97,11 @@ class QuantizedLinear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
+        # Lazily-computed cache of the dequantized float weight (see
+        # ``dequantize_cached``).  Not a buffer/parameter so it is excluded from
+        # the state dict; invalidated whenever quantized params change.
+        self._dequant_cache: Optional[torch.Tensor] = None
+
     # ------------------------------------------------------------------ #
     # Quantization helpers
     # ------------------------------------------------------------------ #
@@ -140,6 +145,8 @@ class QuantizedLinear(nn.Module):
 
     def _pack_weights(self, q: torch.Tensor) -> None:
         """Pack quantized integers into the ``qweight`` uint8 buffer."""
+        # Quantized params are changing; any cached dequantized weight is stale.
+        self._invalidate_weight_cache()
         if self.bits == 8:
             self.qweight.copy_(q.to(torch.uint8).cpu())
         elif self.bits == 4:
@@ -201,9 +208,31 @@ class QuantizedLinear(nn.Module):
     # Forward
     # ------------------------------------------------------------------ #
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Dequantize weights on-the-fly and apply linear transformation."""
+    def _invalidate_weight_cache(self) -> None:
+        """Drop any cached dequantized weight (call when quantized params change)."""
+        self._dequant_cache = None
+
+    def dequantize_cached(self) -> torch.Tensor:
+        """Return the dequantized weight, computing it once and caching it.
+
+        Note: true low-memory / faster inference requires int8 matmul kernels
+        that are not available in pure PyTorch, so dequantizing to float is
+        unavoidable here.  To avoid redoing identical work on every forward
+        pass, we cache the dequantized weight and reuse it.  The cache is
+        invalidated whenever the quantized parameters change (see
+        ``_invalidate_weight_cache``).  Numerical results are unchanged versus
+        calling :meth:`dequantize` directly.
+        """
+        cached = getattr(self, "_dequant_cache", None)
+        if cached is not None:
+            return cached
         weight = self.dequantize()
+        self._dequant_cache = weight
+        return weight
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the linear transform using the (cached) dequantized weights."""
+        weight = self.dequantize_cached()
         return F.linear(x, weight, self.bias)
 
     # ------------------------------------------------------------------ #
@@ -391,7 +420,12 @@ def load_quantized(
     Returns:
         The loaded model (or the state dict if no model was provided).
     """
-    state = torch.load(path, map_location="cpu", weights_only=False)
+    # Security: load with weights_only=True so a malicious checkpoint cannot
+    # execute arbitrary code during unpickling.  The payload written by
+    # ``save_quantized`` is composed only of tensors and primitive containers
+    # (dict/list/int/float/bool/str), all of which are permitted by the safe
+    # weights_only loader.
+    state = torch.load(path, map_location="cpu", weights_only=True)
 
     if not state.pop("_quantized", False):
         warnings.warn("File does not appear to be a quantized model save.", stacklevel=2)
@@ -538,12 +572,27 @@ class AWQQuantizer:
         model.eval()
         try:
             _ = model(calibration_data)
-        except Exception:
-            # If token_ids don't work directly, try embedding path
-            pass
+        except (RuntimeError, ValueError, TypeError, IndexError) as exc:
+            # These are the expected failure modes when the calibration input
+            # doesn't match the model's expected signature/shape (e.g. passing
+            # token ids where embeddings are expected).  We surface a visible
+            # warning rather than silently swallowing every possible error.
+            warnings.warn(
+                f"AWQ calibration forward pass failed ({type(exc).__name__}: {exc}). "
+                f"Activation statistics may be incomplete.",
+                stacklevel=2,
+            )
         finally:
             for h in handles:
                 h.remove()
+
+        if not self.activation_stats:
+            raise RuntimeError(
+                "AWQ calibration collected no activation statistics. The "
+                "calibration forward pass likely failed or the model has no "
+                "nn.Linear layers; check that ``calibration_data`` matches the "
+                "model's expected input."
+            )
 
         return dict(self.activation_stats)
 

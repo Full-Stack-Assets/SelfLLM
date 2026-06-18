@@ -6,9 +6,9 @@ This module enables processing context far beyond the fixed max_seq_len limit:
 - RAGRetriever: External vector database for long-document retrieval
 """
 
+import json
 import math
 import os
-import pickle
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -133,18 +133,17 @@ class SlidingWindowAttention(nn.Module):
             Boolean mask of shape ``[seq_len, kv_len]`` where ``True``
             indicates positions that should be masked out.
         """
-        # Start with a standard causal mask (upper triangular)
-        mask = torch.ones(seq_len, kv_len, device=device, dtype=torch.bool)
-
-        for i in range(seq_len):
-            # In causal attention, position i can attend to [0, i] (with cache offset)
-            query_pos = i
-            # The actual position in the full KV sequence
-            actual_pos = kv_len - seq_len + i
-            # Sliding window: can only attend to last window_size tokens
-            window_start = max(0, actual_pos - self.window_size + 1)
-            # Allow attention from window_start to actual_pos (inclusive)
-            mask[i, window_start:actual_pos + 1] = False
+        # Vectorized construction (equivalent to the per-row loop):
+        # Query row i corresponds to actual_pos = kv_len - seq_len + i in the
+        # full KV sequence and may attend to kv index j when
+        #   max(0, actual_pos - window_size + 1) <= j <= actual_pos.
+        query_idx = torch.arange(seq_len, device=device).unsqueeze(1)  # [seq_len, 1]
+        kv_idx = torch.arange(kv_len, device=device).unsqueeze(0)      # [1, kv_len]
+        actual_pos = kv_len - seq_len + query_idx                       # [seq_len, 1]
+        window_start = (actual_pos - self.window_size + 1).clamp_min(0)
+        allowed = (kv_idx >= window_start) & (kv_idx <= actual_pos)
+        # True indicates positions that should be masked out.
+        mask = ~allowed
 
         return mask
 
@@ -395,45 +394,36 @@ class StreamingAttention(nn.Module):
             Boolean mask of shape ``[seq_len, kv_len]`` where ``True``
             indicates positions that should be masked out.
         """
-        # Start with everything masked out
-        mask = torch.ones(seq_len, kv_len, device=device, dtype=torch.bool)
+        # Vectorized construction (equivalent to the per-row loop).
+        # KV layout is [sinks | recent].  A query row i (actual_pos in the full
+        # sequence) may attend to:
+        #   1. all sink tokens: kv index j < sink_len
+        #   2. recent tokens whose recent-space index r = j - sink_len lies in
+        #      [max(0, recent_index - window_size + 1), recent_index], where
+        #      recent_index = actual_pos - sink_len, and only when r < num_recent.
+        num_recent = kv_len - sink_len
+        query_idx = torch.arange(seq_len, device=device).unsqueeze(1)  # [seq_len, 1]
+        kv_idx = torch.arange(kv_len, device=device).unsqueeze(0)      # [1, kv_len]
+        actual_pos = kv_len - seq_len + query_idx                       # [seq_len, 1]
 
-        for i in range(seq_len):
-            # Position of this query in the full KV sequence
-            actual_pos = kv_len - seq_len + i
+        # Sinks are always visible.
+        sink_allowed = kv_idx < sink_len
 
-            # 1. Always attend to all sink tokens
-            mask[i, :sink_len] = False
+        # Recent-section visibility.
+        recent_index = actual_pos - sink_len                           # [seq_len, 1]
+        window_start_in_recent = (recent_index - self.window_size + 1).clamp_min(0)
+        recent_pos = kv_idx - sink_len                                  # [1, kv_len]
+        recent_allowed = (
+            (kv_idx >= sink_len)
+            & (recent_index >= 0)
+            & (recent_pos >= window_start_in_recent)
+            & (recent_pos <= recent_index)
+            & (recent_pos < num_recent)
+        )
 
-            # 2. Attend to recent window_size tokens (excluding sinks)
-            recent_kv_start = sink_len  # Start of recent section in KV
-            # The sliding window applies to the recent section
-            # Position i in query maps to position actual_pos in full sequence
-            # Within the recent section, the index is actual_pos (since sinks are separate)
-            # Actually, let me reconsider: the KV is [sinks | recent_tokens]
-            # The recent section contains the actual non-sink tokens
-            # We need to allow attention to the last window_size tokens in the recent section
-
-            # The query at position actual_pos should attend to:
-            # - All sink tokens (already unmasked above)
-            # - Recent tokens from max(sink_len, actual_pos - window_size + 1) to actual_pos
-
-            # In the concatenated KV [sinks | recent], the recent part starts at sink_len
-            # The recent tokens that should be visible:
-            recent_start_in_full = sink_len
-            # How many recent tokens are there?
-            num_recent = kv_len - sink_len
-            # Which recent tokens can we attend to?
-            # The query at actual_pos should see recent tokens with indices
-            # in [max(0, num_recent - window_size), num_recent)
-            # But we also need causal: can only see up to actual_pos - sink_len
-            recent_index = actual_pos - sink_len  # This query's index in recent space
-            if recent_index >= 0:
-                window_start_in_recent = max(0, recent_index - self.window_size + 1)
-                # Unmask recent tokens in the window
-                recent_end = min(num_recent, recent_index + 1)
-                if window_start_in_recent < recent_end:
-                    mask[i, sink_len + window_start_in_recent:sink_len + recent_end] = False
+        allowed = sink_allowed | recent_allowed
+        # True indicates positions that should be masked out.
+        mask = ~allowed
 
         return mask
 
@@ -763,9 +753,12 @@ class RAGRetriever:
         """
         os.makedirs(path, exist_ok=True)
 
-        # Save documents
-        with open(os.path.join(path, "documents.pkl"), "wb") as f:
-            pickle.dump(self.documents, f)
+        # Save documents as JSON (safe format; documents are plain text/metadata).
+        # Each document is coerced to a string so the result is always
+        # JSON-serializable.
+        safe_documents = [str(doc) for doc in self.documents]
+        with open(os.path.join(path, "documents.json"), "w", encoding="utf-8") as f:
+            json.dump(safe_documents, f, ensure_ascii=False)
 
         if self.use_faiss:
             self._faiss.write_index(self.index, os.path.join(path, "faiss.index"))
@@ -778,11 +771,11 @@ class RAGRetriever:
         Args:
             path: Directory path to load from.
         """
-        # Load documents
-        doc_path = os.path.join(path, "documents.pkl")
+        # Load documents from JSON (safe; no arbitrary code execution).
+        doc_path = os.path.join(path, "documents.json")
         if os.path.exists(doc_path):
-            with open(doc_path, "rb") as f:
-                self.documents = pickle.load(f)
+            with open(doc_path, "r", encoding="utf-8") as f:
+                self.documents = json.load(f)
 
         if self.use_faiss:
             index_path = os.path.join(path, "faiss.index")

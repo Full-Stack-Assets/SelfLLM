@@ -47,3 +47,10 @@ class ModelConfig:
     moe_expert_d_ff: Optional[int] = None
     moe_capacity_factor: float = 1.25
     moe_aux_loss_weight: float = 0.01
+
+    # Long-context attention. When ``sliding_window`` is set, each token attends
+    # only to the most recent ``sliding_window`` tokens, plus the first
+    # ``attention_sinks`` "sink" tokens -- breaking the quadratic full-context
+    # attention for long sequences.
+    sliding_window: Optional[int] = None
+    attention_sinks: int = 0
