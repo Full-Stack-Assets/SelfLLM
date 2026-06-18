@@ -11,3 +11,10 @@ checkpoints/
 logs/
 real_model/
 *.pt
+
+# V5 real-training artifacts (large; not committed)
+/data/
+/real_model/
+/real_train.log
+/checkpoints/
+/test_checkpoints/

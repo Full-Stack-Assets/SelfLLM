@@ -469,6 +469,7 @@ def serve(
     block_size: int = 16,
     num_blocks: Optional[int] = None,
     kv_cache_mem_gb: float = 4.0,
+    compile_model: bool = False,
 ) -> None:
     """Launch the API server with PagedAttention backend.
 
@@ -486,6 +487,8 @@ def serve(
             ``kv_cache_mem_gb`` and the model's KV footprint per block.
         kv_cache_mem_gb: Target KV cache budget (GB) used to size ``num_blocks``
             when it is not given explicitly.
+        compile_model: If ``True``, wrap the model with ``torch.compile`` for
+            faster inference (falls back to eager on any compilation failure).
     """
     import uvicorn
 
@@ -504,6 +507,10 @@ def serve(
     _model = SelfImprovingLLM.from_pretrained(model_path)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     _model = _model.to(device).eval()
+
+    if compile_model:
+        from selfllm.serving.optimized import compile_model as _compile
+        _model = _compile(_model)
 
     # Setup PagedAttention block manager. Size the pool from a memory budget
     # instead of a hard-coded constant so it scales with model dimensions.
