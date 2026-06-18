@@ -112,3 +112,11 @@ class RecursiveConfig:
     mmlu_source: Optional[Any] = None
     gsm8k_source: Optional[Any] = None
     humaneval_source: Optional[Any] = None
+
+    # Reasoning self-distillation (V6): each iteration, run self-consistency on
+    # the eval prompts and fine-tune the model on the high-confidence reasoning
+    # traces it produced -- self-improvement via its own best reasoning.
+    use_reasoning_distillation: bool = False
+    distillation_num_samples: int = 5       # self-consistency chains per prompt
+    distillation_confidence: float = 0.5    # keep traces with confidence >= this
+    distillation_max_new_tokens: int = 64

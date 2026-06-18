@@ -146,6 +146,40 @@ class TestRecursiveTrainer:
         )
         assert trainer._run_benchmarks() == {}
 
+    def test_reasoning_distillation_trains(
+        self,
+        model: SelfImprovingLLM,
+        tokenizer: BPETokenizer,
+        recursive_config: RecursiveConfig,
+        device: str,
+        monkeypatch,
+    ) -> None:
+        """Self-distillation fine-tunes on high-confidence reasoning traces."""
+        from selfllm.reasoning import ReasoningResult
+
+        class _StubSC:
+            def __init__(self, *a, **k):
+                pass
+
+            def solve(self, question):
+                return ReasoningResult(
+                    answer="X", confidence=1.0,
+                    traces=["the quick brown fox reasoning trace"],
+                    num_samples=2, details={"answers": ["X", "X"]},
+                )
+
+        monkeypatch.setattr("selfllm.reasoning.SelfConsistencyStrategy", _StubSC)
+        recursive_config.use_reasoning_distillation = True
+        recursive_config.distillation_confidence = 0.0
+        trainer = RecursiveSelfTrainer(
+            model.to(device), tokenizer, recursive_config, device=device
+        )
+        before = next(trainer.model.parameters()).detach().clone()
+        trainer._run_reasoning_distillation_step()
+        after = next(trainer.model.parameters()).detach()
+        # High-confidence traces were produced for both eval prompts -> training ran.
+        assert not torch.equal(before, after)
+
     # ------------------------------------------------------------------
     # 1. One iteration completes
     # ------------------------------------------------------------------

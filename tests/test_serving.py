@@ -625,6 +625,36 @@ class TestServerEndpoints:
             )
             assert response.status_code == 422  # Validation error
 
+    def test_chat_completions_reasoning_knob(self, monkeypatch):
+        """/v1/chat/completions with a `reasoning` option runs a strategy."""
+        from fastapi.testclient import TestClient
+        import selfllm.serving.server as server_module
+        from selfllm.model.config import ModelConfig
+        from selfllm.model.model import SelfImprovingLLM
+        from selfllm.model.tokenizer import BPETokenizer
+
+        cfg = ModelConfig(vocab_size=256, d_model=64, n_layers=2, n_heads=4,
+                          d_ff=128, max_seq_len=128, dropout=0.0)
+        model = SelfImprovingLLM(cfg).eval()
+        tok = BPETokenizer(vocab_size=256)
+        tok.train(["The answer is 4.", "Step by step reasoning to a result."])
+
+        monkeypatch.setattr(server_module, "_model", model)
+        monkeypatch.setattr(server_module, "_tokenizer", tok)
+        monkeypatch.setattr(server_module, "_scheduler", None)
+
+        with TestClient(server_module.app) as client:
+            resp = client.post("/v1/chat/completions", json={
+                "model": "selfllm",
+                "messages": [{"role": "user", "content": "What is 2 + 2?"}],
+                "reasoning": {"strategy": "self_consistency", "num_samples": 2,
+                              "answer_type": "free", "max_new_tokens": 6},
+            })
+            assert resp.status_code == 200
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            assert isinstance(content, str)
+
     def test_chat_completions_via_scheduler(
         self, stub_model, mock_tokenizer, block_manager, monkeypatch
     ):
