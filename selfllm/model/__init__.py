@@ -15,6 +15,21 @@ from .lora import (
     load_lora_weights,
 )
 from .speculative import SpeculativeDecoder
+from .moe import MoELayer, Router, MoETransformerBlock
+from .vision import VisionEncoder, MultimodalLLM
+from .long_context import (
+    SlidingWindowAttention,
+    StreamingAttention,
+    RAGRetriever,
+    StreamingKVCache,
+)
+from .quantization import (
+    QuantizedLinear,
+    quantize_model,
+    save_quantized,
+    load_quantized,
+    AWQQuantizer,
+)
 
 __all__ = [
     "ModelConfig",
@@ -33,4 +48,18 @@ __all__ = [
     "save_lora_weights",
     "load_lora_weights",
     "SpeculativeDecoder",
+    "MoELayer",
+    "Router",
+    "MoETransformerBlock",
+    "VisionEncoder",
+    "MultimodalLLM",
+    "SlidingWindowAttention",
+    "StreamingAttention",
+    "RAGRetriever",
+    "StreamingKVCache",
+    "QuantizedLinear",
+    "quantize_model",
+    "save_quantized",
+    "load_quantized",
+    "AWQQuantizer",
 ]

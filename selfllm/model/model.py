@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from .config import ModelConfig
 from .layers import RMSNorm, TransformerBlock
+from .moe import MoETransformerBlock
 
 
 def _create_causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
@@ -48,10 +49,15 @@ class SelfImprovingLLM(nn.Module):
         # Token embeddings
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
 
-        # Transformer blocks
-        self.blocks = nn.ModuleList(
-            [TransformerBlock(config) for _ in range(config.n_layers)]
-        )
+        # Transformer blocks (MoE or dense)
+        if getattr(config, "use_moe", False):
+            self.blocks = nn.ModuleList(
+                [MoETransformerBlock(config) for _ in range(config.n_layers)]
+            )
+        else:
+            self.blocks = nn.ModuleList(
+                [TransformerBlock(config) for _ in range(config.n_layers)]
+            )
 
         # Final layer norm
         self.norm = RMSNorm(config.d_model, eps=config.norm_eps)
@@ -159,6 +165,15 @@ class SelfImprovingLLM(nn.Module):
                 targets.view(-1),
                 ignore_index=-100,
             )
+
+            # Add MoE load-balancing auxiliary loss
+            if getattr(self.config, "use_moe", False):
+                aux_loss = sum(
+                    block.aux_loss for block in self.blocks
+                    if hasattr(block, "aux_loss")
+                )
+                loss = loss + aux_loss * self.config.moe_aux_loss_weight
+
             result["loss"] = loss
 
         return result
