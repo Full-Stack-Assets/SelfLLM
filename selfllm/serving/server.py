@@ -307,9 +307,13 @@ async def _stream_generate(
     """
     device = next(_model.parameters()).device
 
-    input_ids = torch.tensor([prompt_tokens], device=device)
+    # Track the full running context. Each step regenerates from the complete
+    # prompt + tokens emitted so far; feeding only the last token would strip
+    # all prior context (generate() keeps no KV cache across calls).
+    generated_ids: List[int] = []
 
     for _ in range(request.max_tokens):
+        input_ids = torch.tensor([prompt_tokens + generated_ids], device=device)
         with torch.no_grad():
             output = _model.generate(
                 input_ids,
@@ -323,9 +327,9 @@ async def _stream_generate(
         if token_id == _tokenizer.eos_token_id:
             break
 
+        generated_ids.append(token_id)
         text = _tokenizer.decode([token_id])
         yield f"data: {json.dumps({'choices': [{'delta': {'content': text}}]})}\n\n"
-        input_ids = torch.tensor([[token_id]], device=device)
 
     yield "data: [DONE]\n\n"
 

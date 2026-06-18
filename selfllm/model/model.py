@@ -89,19 +89,27 @@ class SelfImprovingLLM(nn.Module):
         self,
         token_ids: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+    ) -> Dict[str, Any]:
         """Forward pass through the model.
 
         Args:
             token_ids: Input token IDs ``[batch, seq_len]``.
             targets: Target token IDs for loss computation ``[batch, seq_len]``.
                      If provided, the loss is computed as cross-entropy.
+            past_key_values: Per-layer ``(k, v)`` caches from a previous call,
+                     used for incremental autoregressive decoding. When given,
+                     ``token_ids`` should contain only the new tokens.
+            use_cache: If ``True``, return the updated per-layer KV caches under
+                     the ``past_key_values`` key.
 
         Returns:
             Dictionary with keys:
                 - ``logits``: ``[batch, seq_len, vocab_size]``
                 - ``loss``: scalar cross-entropy loss (if ``targets`` provided)
                 - ``hidden_states``: ``[batch, seq_len, d_model]``
+                - ``past_key_values``: updated caches (if ``use_cache``)
         """
         batch, seq_len = token_ids.shape
         device = token_ids.device
@@ -110,12 +118,23 @@ class SelfImprovingLLM(nn.Module):
         x = self.token_embedding(token_ids)  # [B, T, D]
         x = self.dropout(x)
 
-        # Causal mask
-        mask = _create_causal_mask(seq_len, device)
+        # Causal mask only for the non-cached (prefill / full) path. During
+        # cached decoding the attention layer builds the correct
+        # ``[q_len, kv_len]`` mask from the cache length, so leave it ``None``.
+        mask = None if past_key_values is not None else _create_causal_mask(seq_len, device)
 
         # Transformer blocks
-        for block in self.blocks:
-            if self.config.grad_checkpoint and self.training:
+        new_caches: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = (
+            [] if use_cache else None
+        )
+        for i, block in enumerate(self.blocks):
+            layer_past = past_key_values[i] if past_key_values is not None else None
+            if use_cache:
+                x, layer_cache = block(
+                    x, mask=mask, kv_cache=layer_past, use_cache=True
+                )
+                new_caches.append(layer_cache)
+            elif self.config.grad_checkpoint and self.training:
                 x = torch.utils.checkpoint.checkpoint(block, x, mask)
             else:
                 x = block(x, mask=mask)
@@ -126,10 +145,13 @@ class SelfImprovingLLM(nn.Module):
         # LM head
         logits = self.lm_head(hidden_states)
 
-        result: Dict[str, torch.Tensor] = {
+        result: Dict[str, Any] = {
             "logits": logits,
             "hidden_states": hidden_states,
         }
+
+        if use_cache:
+            result["past_key_values"] = new_caches
 
         if targets is not None:
             loss = F.cross_entropy(
@@ -194,18 +216,28 @@ class SelfImprovingLLM(nn.Module):
             for b in range(batch_size):
                 seen_tokens[b].scatter_(0, prompt_ids[b], 1.0)
 
+        # Incremental KV cache: prefill the prompt once, then feed a single
+        # token per step. This is O(n) over the generation instead of the
+        # O(n^2) full re-encode of the whole prefix each step.
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
+        next_token: Optional[torch.Tensor] = None
+        max_len = self.config.max_seq_len
+
         for step in range(max_new_tokens):
-            seq_len = generated.shape[1]
-
             # Prepare inputs
-            if seq_len > self.config.max_seq_len:
-                # Truncate to max sequence length
-                input_ids = generated[:, -self.config.max_seq_len :]
+            if past_key_values is None:
+                # Prefill: feed the prompt (truncated to the context window).
+                if generated.shape[1] > max_len:
+                    input_ids = generated[:, -max_len:]
+                else:
+                    input_ids = generated
             else:
-                input_ids = generated
+                # Decode: feed only the most recently sampled token.
+                input_ids = next_token
 
-            # Forward pass
-            out = self.forward(input_ids)
+            # Forward pass (with incremental KV cache)
+            out = self.forward(input_ids, past_key_values=past_key_values, use_cache=True)
+            past_key_values = out["past_key_values"]
             logits = out["logits"][:, -1, :]  # [batch, vocab_size] — last position
             hidden = out["hidden_states"][:, -1, :]  # [batch, d_model]
 

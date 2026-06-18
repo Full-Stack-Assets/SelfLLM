@@ -177,17 +177,12 @@ class ContinuousBatchingScheduler:
         # For each active request, generate one token
         for req in active:
             try:
-                # Get current input
-                if len(req.generated_tokens) == 0:
-                    # First token: use full prompt
-                    input_ids = torch.tensor(
-                        [req.prompt_tokens], device=self.device
-                    )
-                else:
-                    # Subsequent: use last generated token
-                    input_ids = torch.tensor(
-                        [[req.generated_tokens[-1]]], device=self.device
-                    )
+                # Feed the full running context (prompt + everything generated
+                # so far). model.generate() keeps no KV cache across separate
+                # calls, so passing only the last token would condition each
+                # step on a single token and discard all prior context.
+                context = req.prompt_tokens + req.generated_tokens
+                input_ids = torch.tensor([context], device=self.device)
 
                 # Generate one token using the model
                 with torch.no_grad():

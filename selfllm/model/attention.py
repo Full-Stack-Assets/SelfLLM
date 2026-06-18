@@ -84,18 +84,27 @@ class RoPEMultiHeadAttention(nn.Module):
         angles = torch.outer(positions, freqs)  # [max_seq_len, head_dim//2]
         return angles.float()  # [max_seq_len, head_dim//2]
 
-    def _apply_rope(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
+    def _apply_rope(
+        self, x: torch.Tensor, seq_len: int, start_pos: int = 0
+    ) -> torch.Tensor:
         """Apply rotary position embedding to input tensor.
 
         Args:
             x: Tensor of shape ``[batch, n_heads, seq_len, head_dim]``.
             seq_len: Sequence length.
+            start_pos: Absolute position of the first token. Non-zero during
+                incremental decoding, where ``x`` holds new tokens that follow
+                ``start_pos`` already-cached positions.
 
         Returns:
             Rotated tensor of same shape.
         """
         # x shape: [batch, n_heads, seq_len, head_dim]
-        freqs = self.rope_freqs[:seq_len]  # [seq_len, head_dim//2]
+        # Clamp into the precomputed range so decoding past max_seq_len cannot
+        # index out of bounds (positions saturate at the final RoPE entry).
+        max_pos = self.rope_freqs.shape[0]
+        start_pos = min(start_pos, max(0, max_pos - seq_len))
+        freqs = self.rope_freqs[start_pos : start_pos + seq_len]  # [seq_len, head_dim//2]
 
         # Split last dimension into pairs
         x1 = x[..., 0::2]  # [batch, n_heads, seq_len, head_dim//2]
@@ -147,11 +156,15 @@ class RoPEMultiHeadAttention(nn.Module):
         k = k.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Apply RoPE to Q and K
-        q = self._apply_rope(q, seq_len)
-        k = self._apply_rope(k, seq_len)
+        # Apply RoPE to Q and K. During incremental decoding the new tokens
+        # sit at absolute positions starting just after the cached ones.
+        cache_len = kv_cache[0].shape[2] if kv_cache is not None else 0
+        q = self._apply_rope(q, seq_len, start_pos=cache_len)
+        k = self._apply_rope(k, seq_len, start_pos=cache_len)
 
-        # Merge with KV cache if provided (autoregressive generation)
+        # Merge with KV cache if provided (autoregressive generation).
+        # The cached K/V were already rotated when they were produced, so only
+        # the new tokens are rotated above before concatenation.
         if kv_cache is not None:
             cached_k, cached_v = kv_cache
             k = torch.cat([cached_k, k], dim=2)
@@ -170,9 +183,13 @@ class RoPEMultiHeadAttention(nn.Module):
         else:
             causal_mask = mask
 
-        # Scaled dot-product attention (Flash Attention when available)
-        # PyTorch 2.0+ scaled_dot_product_attention handles causal masking internally
-        if mask is None and hasattr(F, "scaled_dot_product_attention"):
+        # Scaled dot-product attention (Flash Attention when available).
+        # PyTorch 2.0+ scaled_dot_product_attention handles causal masking
+        # internally, but its ``is_causal`` shortcut assumes a square
+        # ``q_len == kv_len`` attention matrix. During cached decoding
+        # ``q_len`` (1) is shorter than ``kv_len``, so fall back to the explicit
+        # masked path which aligns the causal mask to the cache length.
+        if mask is None and kv_cache is None and hasattr(F, "scaled_dot_product_attention"):
             attn_out = F.scaled_dot_product_attention(
                 q,
                 k,

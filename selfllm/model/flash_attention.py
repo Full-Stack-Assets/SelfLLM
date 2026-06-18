@@ -322,12 +322,32 @@ class HybridAttention(nn.Module):
         mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[Any] = None,
         is_prefill: bool = True,
+        use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Any]]:
-        """Forward pass -- delegates to the selected backend."""
+        """Forward pass -- delegates to the selected backend.
+
+        Normalises the two backends' differing cache conventions so callers
+        get a single contract: when ``use_cache`` is ``True`` an updated KV
+        cache is always returned (and populated on prefill); when it is
+        ``False`` the returned cache is ``None``.
+        """
         if self.backend == "flash_attn":
-            return self.attn(x, mask=mask, kv_cache=kv_cache, is_prefill=is_prefill)
-        # Standard backend (RoPEMultiHeadAttention) does not accept is_prefill
-        return self.attn(x, mask=mask, kv_cache=kv_cache)
+            # FlashAttention2 only populates a cache when one is passed in, so
+            # seed an empty cache on prefill to capture the prompt's K/V.
+            if use_cache and kv_cache is None:
+                batch = x.shape[0]
+                empty = x.new_zeros(batch, 0, self.n_heads, self.head_dim)
+                kv_cache = (empty, empty.clone())
+            if kv_cache is not None:
+                is_prefill = kv_cache[0].shape[1] == 0
+            out, new_cache = self.attn(
+                x, mask=mask, kv_cache=kv_cache, is_prefill=is_prefill
+            )
+        else:
+            # Standard backend (RoPEMultiHeadAttention) does not accept
+            # is_prefill and always returns the updated cache.
+            out, new_cache = self.attn(x, mask=mask, kv_cache=kv_cache)
+        return out, (new_cache if use_cache else None)
 
     @property
     def backend_name(self) -> str:
