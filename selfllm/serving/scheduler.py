@@ -8,6 +8,7 @@ of requests and processes them in batches. Each iteration:
 4. Repeats
 """
 
+import math
 import threading
 import time
 import uuid
@@ -157,6 +158,8 @@ class ContinuousBatchingScheduler:
             List of newly completed requests this step.
         """
         completed: List[Request] = []
+        max_len = getattr(getattr(self.model, "config", None), "max_seq_len", 2048)
+        block_size = self.block_manager.block_size
 
         with self._lock:
             newly_admitted: List[Request] = []
@@ -165,12 +168,32 @@ class ContinuousBatchingScheduler:
                 and self.waiting_queue
             ):
                 req = self.waiting_queue[0]
+
+                # A request asking for no tokens finishes immediately.
+                if req.max_new_tokens <= 0:
+                    self.waiting_queue.pop(0)
+                    self._finish(req, "length")
+                    completed.append(req)
+                    continue
+
+                # Cap block allocation at the model's context window (the prompt
+                # is truncated to max_len at prefill, so longer prompts must not
+                # reserve — or be rejected for — blocks they will never use).
+                prompt_len = min(max(1, len(req.prompt_tokens)), max_len)
+
+                # A prompt that cannot fit the whole pool can never be admitted;
+                # reject it instead of retrying forever (which would also block
+                # every request queued behind it).
+                if math.ceil(prompt_len / block_size) > self.block_manager.num_blocks:
+                    self.waiting_queue.pop(0)
+                    self._finish(req, "error")
+                    completed.append(req)
+                    continue
+
                 try:
-                    req.block_ids = self.block_manager.allocate(
-                        max(1, len(req.prompt_tokens))
-                    )
+                    req.block_ids = self.block_manager.allocate(prompt_len)
                 except RuntimeError:
-                    break  # out of blocks; retry next step
+                    break  # transient out-of-blocks; retry next step
                 self.waiting_queue.pop(0)
                 req.status = "running"
                 self.active_requests.append(req)

@@ -48,6 +48,27 @@ def _create_sliding_window_mask(
     return masked
 
 
+def _create_sliding_window_decode_mask(
+    seq_len: int, cache_len: int, device: torch.device, window: int, sinks: int = 0
+) -> torch.Tensor:
+    """Sliding-window + sink mask for cached decoding.
+
+    The ``seq_len`` new tokens sit at absolute positions ``cache_len ..
+    cache_len + seq_len - 1`` and attend over the full ``kv_len = cache_len +
+    seq_len`` keys. A query at absolute position ``p`` attends to keys ``q``
+    with ``q <= p`` and ``q > p - window``, plus the first ``sinks`` keys.
+    Returns a boolean ``[seq_len, kv_len]`` mask (``True`` = masked out).
+    """
+    kv_len = cache_len + seq_len
+    qpos = torch.arange(cache_len, kv_len, device=device).unsqueeze(1)  # [S, 1]
+    kpos = torch.arange(kv_len, device=device).unsqueeze(0)             # [1, kv_len]
+    masked = (kpos > qpos) | (kpos <= qpos - window)
+    if sinks > 0:
+        keep_sink = (kpos < sinks) & (kpos <= qpos)
+        masked = masked & ~keep_sink
+    return masked
+
+
 class SelfImprovingLLM(nn.Module):
     """Complete transformer language model for recursive self-improvement.
 
@@ -148,17 +169,25 @@ class SelfImprovingLLM(nn.Module):
         x = self.token_embedding(token_ids)  # [B, T, D]
         x = self.dropout(x)
 
-        # Causal mask only for the non-cached (prefill / full) path. During
-        # cached decoding the attention layer builds the correct
-        # ``[q_len, kv_len]`` mask from the cache length, so leave it ``None``.
+        # Build the attention mask. For the non-cached (prefill / full) path the
+        # attention layer would build a plain causal mask from ``mask=None``;
+        # we supply an explicit mask so sliding-window models stay windowed on
+        # *both* prefill and cached decode (otherwise decode would silently
+        # attend to the full unbounded history).
+        window = getattr(self.config, "sliding_window", None)
+        sinks = getattr(self.config, "attention_sinks", 0)
         if past_key_values is not None:
-            mask = None
-        elif getattr(self.config, "sliding_window", None):
-            # Long-context: restrict attention to a sliding window + sinks.
-            mask = _create_sliding_window_mask(
-                seq_len, device, self.config.sliding_window,
-                getattr(self.config, "attention_sinks", 0),
-            )
+            if window and positions is None and key_padding_mask is None:
+                cache_len = past_key_values[0][0].shape[2]
+                mask = _create_sliding_window_decode_mask(
+                    seq_len, cache_len, device, window, sinks
+                )
+            else:
+                # Cached decode: attention builds the correct causal mask from
+                # the cache length (or batched serving supplies positions/mask).
+                mask = None
+        elif window:
+            mask = _create_sliding_window_mask(seq_len, device, window, sinks)
         else:
             mask = _create_causal_mask(seq_len, device)
 

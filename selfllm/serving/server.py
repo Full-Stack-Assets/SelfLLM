@@ -86,6 +86,10 @@ _model: Optional[torch.nn.Module] = None
 _tokenizer: Optional[Any] = None
 _scheduler: Optional[Any] = None
 
+# Safety cap: an endpoint never waits longer than this for a scheduled request
+# to finish, so a wedged/un-schedulable request cannot hang the connection.
+_REQUEST_TIMEOUT_S = 300.0
+
 # --- FastAPI App ---
 
 
@@ -402,7 +406,10 @@ async def _generate_via_scheduler(
         temperature=request.temperature,
         top_p=request.top_p,
     )
+    deadline = time.monotonic() + _REQUEST_TIMEOUT_S
     while not req.is_finished:
+        if time.monotonic() > deadline:
+            break
         await asyncio.sleep(0.005)
     gen = list(req.generated_tokens)
     if gen and gen[-1] == _tokenizer.eos_token_id:
@@ -423,6 +430,7 @@ async def _stream_via_scheduler(
     stop_sequences = request.stop or []
     emitted_text = ""
     emitted_count = 0
+    deadline = time.monotonic() + _REQUEST_TIMEOUT_S
 
     while True:
         gen = list(req.generated_tokens)
@@ -444,6 +452,8 @@ async def _stream_via_scheduler(
             emitted_count = len(display)
 
         if req.is_finished and emitted_count >= len(display):
+            break
+        if time.monotonic() > deadline:
             break
         await asyncio.sleep(0.005)
 

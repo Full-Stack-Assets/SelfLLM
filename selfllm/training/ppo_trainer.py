@@ -266,8 +266,10 @@ class PPOTrainer:
         sequences = gen_result["sequences"]  # [B, prompt_len + gen_len]
         seq_len = sequences.shape[1]
 
-        # Compute per-token log-probs under policy (with grad for later use)
-        self.policy_model.train()
+        # Compute the rollout (old) per-token log-probs deterministically:
+        # eval() disables dropout so the PPO ratio exp(new - old) starts at 1.0
+        # with identical weights instead of being perturbed by dropout noise.
+        self.policy_model.eval()
         policy_outputs = self.policy_model(sequences)
         policy_logits = policy_outputs["logits"]  # [B, T, V]
 
@@ -544,8 +546,10 @@ class PPOTrainer:
         }
 
         for epoch in range(self.num_ppo_epochs):
-            # Compute current policy log probs
-            self.policy_model.train()
+            # Compute current policy log probs. Use eval() so dropout is off and
+            # the ratio against the (also dropout-free) old log-probs is exact;
+            # gradients still flow through the eval-mode forward.
+            self.policy_model.eval()
             policy_outputs = self.policy_model(sequences)
             policy_logits = policy_outputs["logits"]
             policy_log_probs_all = F.log_softmax(policy_logits, dim=-1)
@@ -558,7 +562,7 @@ class PPOTrainer:
             )  # [B, T-1]
 
             # Compute current value estimates
-            self.value_model.train()
+            self.value_model.eval()
             current_values = self.value_model(sequences)[:, :-1]  # [B, T-1]
 
             # Compute PPO loss (response tokens only)

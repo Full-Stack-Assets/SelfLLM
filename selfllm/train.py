@@ -698,6 +698,13 @@ def cmd_ppo(cfg: Dict[str, Any], logger: Logger) -> None:
     tokenizer = BPETokenizer(vocab_size=cfg["model"].get("vocab_size", 32000))
     tokenizer.load(tokenizer_path)
 
+    logger.warning(
+        "PPO is using a freshly-initialized RewardModel score head that has not "
+        "been trained. The reward signal is therefore not meaningful -- this "
+        "subcommand is a working scaffold for RLHF, not a useful reward model. "
+        "Train/load a real reward model before relying on PPO results."
+    )
+
     trainer = PPOTrainer(
         policy_model=model,
         ref_model=copy.deepcopy(model),
@@ -710,7 +717,9 @@ def cmd_ppo(cfg: Dict[str, Any], logger: Logger) -> None:
         "Once upon a time, in a distant land,",
         "The most important scientific discovery was",
     ]
-    num_iterations = cfg.get("num_iterations") or 5
+    num_iterations = cfg.get("num_iterations")
+    if num_iterations is None:
+        num_iterations = 5
 
     logger.info(f"Running {num_iterations} PPO iterations on {len(prompts)} prompts...")
     for it in range(num_iterations):

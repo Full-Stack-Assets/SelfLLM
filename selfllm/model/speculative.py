@@ -208,6 +208,7 @@ class SpeculativeDecoder:
             # ---- 3. Accept/reject each draft token ----
             accepted = []
             rejected = False
+            n_draft_accepted = 0  # draft tokens accepted this round (pre-trim)
 
             for k in range(draft_tokens.shape[1]):
                 draft_token = draft_tokens[0, k].item()
@@ -217,7 +218,7 @@ class SpeculativeDecoder:
                     target_best = torch.argmax(target_probs[0, k]).item()
                     if target_best == draft_token:
                         accepted.append(draft_token)
-                        self.accepted_tokens += 1
+                        n_draft_accepted += 1
                     else:
                         accepted.append(target_best)
                         rejected = True
@@ -240,7 +241,7 @@ class SpeculativeDecoder:
 
                     if u < acceptance_prob:
                         accepted.append(draft_token)
-                        self.accepted_tokens += 1
+                        n_draft_accepted += 1
                     else:
                         # Reject: resample from residual
                         # p_residual ∝ p_target - p_draft (clamped)
@@ -256,14 +257,18 @@ class SpeculativeDecoder:
                         rejected = True
                         break
 
-            # Stop at EOS: truncate the accepted run at the first EOS token.
+            # Apply the budget cap first, then stop at EOS within the surviving
+            # tokens -- this way an EOS that lands beyond the budget is trimmed
+            # (we stopped on length, not EOS) and an EOS within budget is kept.
+            if num_generated + len(accepted) > max_new_tokens:
+                accepted = accepted[: max_new_tokens - num_generated]
             if eos_token_id is not None and eos_token_id in accepted:
                 accepted = accepted[: accepted.index(eos_token_id) + 1]
                 stop = True
 
-            # Don't exceed the requested budget.
-            if num_generated + len(accepted) > max_new_tokens:
-                accepted = accepted[: max_new_tokens - num_generated]
+            # Count only the draft acceptances that survived truncation so the
+            # acceptance rate reflects tokens actually emitted.
+            self.accepted_tokens += min(n_draft_accepted, len(accepted))
 
             # Append accepted tokens to the generated sequence
             if accepted:
