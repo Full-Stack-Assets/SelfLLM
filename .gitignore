@@ -6,10 +6,8 @@ test_checkpoints/
 __pycache__/
 *.egg-info/
 
-# Coverage artifacts
-.coverage
-coverage.xml
-htmlcov/
+# MkDocs build output (GitHub Pages)
+site/
 
 # Training / serving outputs
 checkpoints/
