@@ -216,6 +216,34 @@ class TestRecursiveTrainer:
         trainer._run_reward_model_step()
         assert trainer.reward_trainer is rt
 
+    def test_reward_guided_selection(
+        self,
+        model: SelfImprovingLLM,
+        tokenizer: BPETokenizer,
+        recursive_config: RecursiveConfig,
+        device: str,
+    ) -> None:
+        """Reward-guided selection keeps the highest-reward samples."""
+        recursive_config.reward_keep_fraction = 0.5
+        trainer = RecursiveSelfTrainer(
+            model.to(device), tokenizer, recursive_config, device=device
+        )
+
+        class _StubRT:  # score = text length -> longer responses score higher
+            def score(self, text):
+                return float(len(text))
+
+        trainer.reward_trainer = _StubRT()
+        samples = [
+            {"prompt": "p", "response": "a"},
+            {"prompt": "p", "response": "aa"},
+            {"prompt": "p", "response": "aaa"},
+            {"prompt": "p", "response": "aaaa"},
+        ]
+        kept = trainer._reward_select(samples)
+        assert len(kept) == 2  # top 50%
+        assert {s["response"] for s in kept} == {"aaaa", "aaa"}
+
     # ------------------------------------------------------------------
     # 1. One iteration completes
     # ------------------------------------------------------------------

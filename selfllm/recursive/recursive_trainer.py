@@ -211,6 +211,15 @@ class RecursiveSelfTrainer:
               f"({len(filtered_samples)} new + "
               f"{len(training_samples) - len(filtered_samples)} replay).")
 
+        # Step 3b: optional reward-guided selection -- keep the highest-reward
+        # samples (per the reward model trained in prior iterations).
+        if (
+            getattr(self.config, "use_reward_guided_selection", False)
+            and self.reward_trainer is not None
+            and len(training_samples) > 1
+        ):
+            training_samples = self._reward_select(training_samples)
+
         # Guard: skip training if no samples available
         if len(training_samples) == 0:
             print("  ⚠️  No training samples available. Skipping training step.")
@@ -942,6 +951,36 @@ class RecursiveSelfTrainer:
             print(f"  ⚠️  Reward-model step failed "
                   f"({type(e).__name__}: {e}); continuing.")
             return {}
+
+    def _reward_select(self, samples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Keep the top ``reward_keep_fraction`` of samples by reward-model score.
+
+        Scores each ``prompt + response`` with the persistent reward model and
+        retains the highest-scoring fraction, so the model fine-tunes on its own
+        best (highest-reward) generations. Guarded: on any failure all samples
+        are kept.
+        """
+        try:
+            keep_fraction = getattr(self.config, "reward_keep_fraction", 0.7)
+            scored = [
+                (
+                    self.reward_trainer.score(
+                        s.get("prompt", "") + s.get("response", "")
+                    ),
+                    s,
+                )
+                for s in samples
+            ]
+            scored.sort(key=lambda pair: pair[0], reverse=True)
+            n_keep = max(1, int(len(scored) * keep_fraction))
+            selected = [s for _, s in scored[:n_keep]]
+            print(f"  [Step 3b] Reward-guided selection: kept "
+                  f"{len(selected)}/{len(samples)} highest-reward samples.")
+            return selected
+        except Exception as e:  # pragma: no cover - defensive guard
+            print(f"  ⚠️  Reward-guided selection failed "
+                  f"({type(e).__name__}: {e}); using all samples.")
+            return samples
 
     def _save_metrics_history(self) -> None:
         """Persist the full metrics history to JSON in the checkpoint dir."""
