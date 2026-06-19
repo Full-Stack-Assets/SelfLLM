@@ -1,0 +1,4 @@
+# Documentation site build dependencies (GitHub Pages).
+# Install with: pip install -r requirements-docs.txt
+mkdocs==1.6.1
+mkdocs-material==9.5.49
