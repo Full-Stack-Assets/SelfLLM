@@ -72,7 +72,10 @@ class RoPE(nn.Module):
         Returns:
             Rotated tensor of the same shape as ``x``.
         """
-        # Gather cos/sin for the requested positions
+        # Gather cos/sin for the requested positions. Saturate at the final
+        # cached entry so positions beyond max_seq_len don't index out of bounds
+        # (matches the standard backend's behavior for over-long sequences).
+        positions = positions.clamp(max=self.cos_cached.shape[0] - 1)
         cos = self.cos_cached[positions]  # [T, D//2]
         sin = self.sin_cached[positions]  # [T, D//2]
 

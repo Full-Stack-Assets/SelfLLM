@@ -249,6 +249,34 @@ class SelfImprovingLLM(nn.Module):
     # Generation
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _evict_kv_cache(
+        past_key_values: List[Tuple[torch.Tensor, torch.Tensor]],
+        sinks: int,
+        window: int,
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """Trim each layer's KV cache to ``sinks`` initial + ``window`` recent keys.
+
+        Bounds decode memory to ``sinks + window`` per layer (StreamingLLM-style
+        attention sinks + a rolling window). Caches at or under the budget are
+        left untouched. Each cache entry has shape ``[B, H, L, head_dim]``.
+        """
+        budget = sinks + window
+        evicted: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for k, v in past_key_values:
+            length = k.shape[2]
+            if length <= budget:
+                evicted.append((k, v))
+                continue
+            if sinks > 0:
+                k = torch.cat([k[:, :, :sinks], k[:, :, length - window:]], dim=2)
+                v = torch.cat([v[:, :, :sinks], v[:, :, length - window:]], dim=2)
+            else:
+                k = k[:, :, length - window:]
+                v = v[:, :, length - window:]
+            evicted.append((k, v))
+        return evicted
+
     @torch.no_grad()
     def generate(
         self,
@@ -309,6 +337,16 @@ class SelfImprovingLLM(nn.Module):
         # own stop token rather than waiting for every row to emit one.
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
+        # Sliding-window KV-cache eviction: for a windowed model, keep only the
+        # first `attention_sinks` keys plus the most recent `sliding_window`,
+        # bounding decode memory to O(window) instead of O(n). The new token is
+        # given its true absolute position so the kept recent window stays
+        # positionally correct.
+        window = getattr(self.config, "sliding_window", None)
+        sinks = getattr(self.config, "attention_sinks", 0)
+        use_evict = bool(window)
+        abs_pos = 0  # absolute position of the next token fed to the model
+
         for step in range(max_new_tokens):
             # Prepare inputs
             if past_key_values is None:
@@ -321,9 +359,26 @@ class SelfImprovingLLM(nn.Module):
                 # Decode: feed only the most recently sampled token.
                 input_ids = next_token
 
-            # Forward pass (with incremental KV cache)
-            out = self.forward(input_ids, past_key_values=past_key_values, use_cache=True)
+            # Forward pass (with incremental KV cache). When evicting, pass the
+            # new token's true absolute position so its RoPE matches the kept
+            # recent-window keys (which retain their original rotations).
+            if use_evict and past_key_values is not None:
+                positions = torch.full(
+                    (batch_size, input_ids.shape[1]), abs_pos,
+                    device=device, dtype=torch.long,
+                )
+                out = self.forward(
+                    input_ids, past_key_values=past_key_values,
+                    use_cache=True, positions=positions,
+                )
+            else:
+                out = self.forward(
+                    input_ids, past_key_values=past_key_values, use_cache=True
+                )
             past_key_values = out["past_key_values"]
+            abs_pos += input_ids.shape[1]
+            if use_evict:
+                past_key_values = self._evict_kv_cache(past_key_values, sinks, window)
             logits = out["logits"][:, -1, :]  # [batch, vocab_size] — last position
             hidden = out["hidden_states"][:, -1, :]  # [batch, d_model]
 
