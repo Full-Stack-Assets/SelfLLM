@@ -1,18 +1,5 @@
-# Build context for Docker / Fly.io / Cloud Run image builds.
-# Keep: selfllm/, real_model/, requirements.txt, setup.py, Dockerfile.
+fly.toml
 .git/
-.github/
 __pycache__/
-*.pyc
-
-tests/
-docs/
-results/
-*.md
-
-data/
-data_small/
-checkpoints/
-test_checkpoints/
-*.log
-result.json
+.envrc
+.venv/
