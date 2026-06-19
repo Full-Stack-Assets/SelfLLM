@@ -118,10 +118,15 @@ class RoPEMultiHeadAttention(nn.Module):
             cos_freqs = torch.cos(freqs).unsqueeze(1)  # [batch, 1, seq_len, hd//2]
             sin_freqs = torch.sin(freqs).unsqueeze(1)
         else:
-            # Clamp into the precomputed range so decoding past max_seq_len
-            # cannot index out of bounds (positions saturate at the final entry).
-            start_pos = min(start_pos, max(0, max_pos - seq_len))
-            freqs = self.rope_freqs[start_pos : start_pos + seq_len]  # [seq_len, hd//2]
+            # Saturating index: positions at/beyond the precomputed table reuse
+            # its final entry. This keeps freqs exactly ``seq_len`` long even
+            # when the sequence is longer than max_seq_len -- otherwise slicing
+            # past the table returns too few rows and the rotation below fails
+            # with a shape mismatch (a 500 on any over-long prompt).
+            idx = torch.arange(
+                start_pos, start_pos + seq_len, device=self.rope_freqs.device
+            ).clamp(max=max_pos - 1)
+            freqs = self.rope_freqs[idx]  # [seq_len, hd//2]
             cos_freqs = torch.cos(freqs).unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, hd//2]
             sin_freqs = torch.sin(freqs).unsqueeze(0).unsqueeze(0)
 

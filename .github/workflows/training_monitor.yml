@@ -1,0 +1,428 @@
+name: Training Monitor
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "results/*.json"
+      - "run_output/**"
+  schedule:
+    # Saturday 06:00 UTC = Saturday midnight EDT
+    - cron: "0 6 * * 6"
+  workflow_dispatch:
+    inputs:
+      summary_path:
+        description: "Path to training_summary.json (relative to repo root)"
+        required: false
+        default: "results/training_summary.json"
+      benchmark_path:
+        description: "Path to benchmark_raw.json"
+        required: false
+        default: "results/benchmark_raw.json"
+
+concurrency:
+  group: training-monitor-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-training:
+    name: Validate Training Metrics
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate training_summary.json
+        env:
+          SUMMARY_PATH: ${{ github.event_name == 'workflow_dispatch' && inputs.summary_path || 'results/training_summary.json' }}
+        run: |
+          python - <<'PYEOF'
+          import json, sys, os
+
+          SUMMARY = os.environ["SUMMARY_PATH"]
+
+          if not os.path.exists(SUMMARY):
+              print(f"WARNING: {SUMMARY} not found — skipping training validation")
+              sys.exit(0)
+
+          with open(SUMMARY) as f:
+              s = json.load(f)
+
+          errors = []
+
+          for key in ("model_params", "pretrain", "lora", "self_improvement"):
+              if key not in s:
+                  errors.append(f"Missing key: {key}")
+
+          if not errors:
+              pretrain = s.get("pretrain", {})
+              loss_hist = pretrain.get("loss_history", [])
+              if len(loss_hist) >= 2:
+                  for i in range(1, len(loss_hist)):
+                      if loss_hist[i] >= loss_hist[i - 1]:
+                          print(
+                              f"WARNING: Pre-training loss did not decrease at epoch {i+1}: "
+                              f"{loss_hist[i-1]:.4f} -> {loss_hist[i]:.4f}"
+                          )
+
+              si = s.get("self_improvement", {})
+              iters = si.get("iterations_run", 0)
+              if iters == 0:
+                  errors.append("self_improvement.iterations_run = 0")
+
+              params = s.get("model_params", 0)
+              if params < 100_000:
+                  errors.append(f"Suspiciously small model: {params} params")
+
+              lora = s.get("lora", {})
+              lora_pct = lora.get("lora_pct", 0.0)
+              if lora_pct > 10.0:
+                  errors.append(f"LoRA trainable% too high: {lora_pct:.1f}% (expected <10%)")
+
+          print("=== Training Summary Validation ===")
+          print(f"Model params: {s.get('model_params', 'N/A'):,}")
+          pt = s.get("pretrain", {})
+          print(f"Pretrain epochs: {pt.get('epochs', 'N/A')}")
+          lh = pt.get("loss_history", [])
+          if lh:
+              print("Pretrain losses:", " -> ".join(f"{x:.4f}" for x in lh))
+          si = s.get("self_improvement", {})
+          print(f"SI iterations: {si.get('iterations_run', 'N/A')}")
+          print(f"SI duration: {si.get('duration_s', 'N/A')}s")
+          print(f"Loss improvement: {si.get('loss_improvement_pct', 'N/A')}%")
+
+          if errors:
+              print("\nVALIDATION ERRORS:")
+              for e in errors:
+                  print(f" - {e}")
+              sys.exit(1)
+          else:
+              print("\nValidation PASSED")
+          PYEOF
+
+  regression-check:
+    name: Regression Detection
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch==2.2.2+cpu --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy==1.26.4
+          pip install -e ".[dev]"
+
+      - name: Run regression detector over results/
+        run: |
+          python - <<'PYEOF'
+          import json, os, sys, glob
+          from selfllm.eval.regression import RegressionDetector
+          from selfllm.eval.suite import SuiteResult
+          from selfllm.eval.harness import EvalResult
+
+          snapshots = sorted(glob.glob("results/eval_*.json"))
+          if not snapshots:
+              print("No eval snapshots found in results/ — skipping regression check")
+              sys.exit(0)
+
+          print(f"Found {len(snapshots)} eval snapshot(s)")
+          detector = RegressionDetector(hard_threshold=0.05, soft_threshold=0.02, patience=3)
+          all_alerts = []
+
+          for path in snapshots:
+              with open(path) as f:
+                  data = json.load(f)
+
+              results = [
+                  EvalResult(
+                      name=r["name"],
+                      score=r["score"],
+                      n=r["n"],
+                      details=r.get("details", {}),
+                  )
+                  for r in data.get("results", [])
+              ]
+
+              suite_result = SuiteResult(
+                  tag=data.get("tag", os.path.basename(path)),
+                  timestamp=data.get("timestamp", 0),
+                  results=results,
+                  elapsed_s=data.get("elapsed_s", 0),
+              )
+
+              alerts = detector.update(suite_result)
+              all_alerts.extend(alerts)
+
+          print("\n=== Regression Summary ===")
+          summary = detector.summary()
+          for name, info in summary.items():
+              print(
+                  f" {name}: latest={info['latest']:.3f} "
+                  f"best={info['best']:.3f} steps={info['n_steps']}"
+              )
+
+          if all_alerts:
+              print(f"\nREGRESSIONS DETECTED ({len(all_alerts)}):")
+              for a in all_alerts:
+                  print(f" [{a.severity.upper()}] {a.message}")
+
+              hard = [a for a in all_alerts if a.severity == "hard"]
+              if hard:
+                  sys.exit(1)
+              else:
+                  print("(Only soft regressions — workflow passes with warning)")
+          else:
+              print("No regressions detected.")
+          PYEOF
+
+  serving-metrics:
+    name: Serving Metrics Monitor
+    runs-on: ubuntu-latest
+    if: |
+      contains(github.event.head_commit.message, 'training') ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check benchmark_raw.json (if present)
+        env:
+          BENCHMARK_PATH: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_path || 'results/benchmark_raw.json' }}
+        run: |
+          python - <<'PYEOF'
+          import json, os, sys
+
+          BENCH = os.environ["BENCHMARK_PATH"]
+
+          if not os.path.exists(BENCH):
+              print(f"benchmark_raw.json not found at {BENCH} — skipping serving metrics check")
+              sys.exit(0)
+
+          with open(BENCH) as f:
+              rows = json.load(f)
+
+          print("=== Serving Engine Metrics ===")
+          baseline_tps = {}
+
+          for row in rows:
+              eng = row.get("engine", "")
+              wl = row.get("workload", "")
+              tps = row.get("tokens_per_sec", 0)
+              avg = row.get("avg_latency_s", 0) * 1000
+              p95 = row.get("p95_latency_s", 0) * 1000
+              print(f" {eng:25s} | {wl:20s} | {tps:7.1f} tok/s | avg={avg:.0f}ms p95={p95:.0f}ms")
+
+              if eng == "A_baseline_eager":
+                  baseline_tps[wl] = tps
+
+          zero_tps = [r for r in rows if r.get("tokens_per_sec", 0) < 1.0]
+          if zero_tps:
+              print("\nERROR: Zero-throughput results detected:")
+              for r in zero_tps:
+                  print(f" {r['engine']} / {r['workload']}")
+              sys.exit(1)
+          else:
+              print("\nAll serving metrics look healthy.")
+          PYEOF
+
+  weekly-summary:
+    name: Weekly Regression Summary
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    outputs:
+      hard_regression: ${{ steps.scan.outputs.hard_regression }}
+      regression_report: ${{ steps.scan.outputs.regression_report }}
+      run_url: ${{ steps.scan.outputs.run_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch==2.2.2+cpu --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy==1.26.4
+          pip install -e ".[dev]"
+
+      - name: Scan past-7-day eval snapshots
+        id: scan
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          python - <<'PYEOF'
+          import json, os, sys, glob, time
+          from datetime import datetime, timezone
+          from selfllm.eval.regression import RegressionDetector
+          from selfllm.eval.suite import SuiteResult
+          from selfllm.eval.harness import EvalResult
+
+          now_ts = time.time()
+          week_ago = now_ts - 7 * 24 * 3600
+          all_snaps = sorted(glob.glob("results/eval_*.json"))
+          recent = []
+
+          for path in all_snaps:
+              try:
+                  mtime = os.path.getmtime(path)
+                  with open(path) as f:
+                      data = json.load(f)
+                  ts = data.get("timestamp", mtime)
+                  if ts >= week_ago:
+                      recent.append((ts, path, data))
+              except Exception as exc:
+                  print(f"WARNING: could not parse {path}: {exc}")
+
+          recent.sort(key=lambda x: x[0])
+
+          gh_repo = os.environ.get("GH_REPO", "")
+          gh_run_id = os.environ.get("GH_RUN_ID", "")
+          run_url = f"https://github.com/{gh_repo}/actions/runs/{gh_run_id}"
+
+          print(f"Weekly scan: {len(recent)} snapshot(s) in the past 7 days")
+
+          if not recent:
+              print("No snapshots this week — nothing to scan")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as gh_out:
+                  gh_out.write("hard_regression=false\n")
+                  gh_out.write("regression_report=No eval snapshots found for the past 7 days.\n")
+                  gh_out.write(f"run_url={run_url}\n")
+              sys.exit(0)
+
+          detector = RegressionDetector(hard_threshold=0.05, soft_threshold=0.02, patience=3)
+          all_alerts = []
+
+          for ts, path, data in recent:
+              results = [
+                  EvalResult(
+                      name=r["name"],
+                      score=r["score"],
+                      n=r["n"],
+                      details=r.get("details", {}),
+                  )
+                  for r in data.get("results", [])
+              ]
+
+              suite_result = SuiteResult(
+                  tag=data.get("tag", os.path.basename(path)),
+                  timestamp=ts,
+                  results=results,
+                  elapsed_s=data.get("elapsed_s", 0),
+              )
+              alerts = detector.update(suite_result)
+              all_alerts.extend(alerts)
+
+          lora_alerts = []
+          summary_path = "results/training_summary.json"
+          if os.path.exists(summary_path):
+              with open(summary_path) as f:
+                  summary_data = json.load(f)
+
+              si = summary_data.get("self_improvement", {})
+              first_loss = si.get("first_iter_loss", 0.0)
+              last_loss = si.get("last_iter_loss", 0.0)
+
+              if first_loss > 0 and last_loss > first_loss * 1.20:
+                  pct = ((last_loss / first_loss) - 1) * 100
+                  lora_alerts.append(
+                      f"LoRA injection degraded: SI loss {first_loss:.4f} -> "
+                      f"{last_loss:.4f} (+{pct:.1f}%)"
+                  )
+
+              lora_pct = summary_data.get("lora", {}).get("lora_pct", 0.0)
+              if lora_pct > 10.0:
+                  lora_alerts.append(f"LoRA trainable ratio too high: {lora_pct:.1f}%")
+          else:
+              print(f"NOTE: {summary_path} not found — LoRA health checks skipped")
+
+          week_start = datetime.fromtimestamp(week_ago, tz=timezone.utc).strftime("%Y-%m-%d")
+          week_end = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+          hard_alerts = [a for a in all_alerts if a.severity == "hard"]
+          soft_alerts = [a for a in all_alerts if a.severity == "soft"]
+
+          lines = [
+              "=== WEEKLY REGRESSION REPORT ===",
+              f"Period: {week_start} — {week_end} ({len(recent)} snapshots scanned)",
+              f"Run URL: {run_url}",
+              "",
+          ]
+
+          det_summary = detector.summary()
+          if det_summary:
+              lines.append("Benchmark trends (latest vs best this week):")
+              for bname, info in det_summary.items():
+                  trend = "OK" if info["latest"] >= info["best"] * 0.98 else "DEGRADED"
+                  lines.append(
+                      f" {bname:20s}: latest={info['latest']:.3f} "
+                      f"best={info['best']:.3f} steps={info['n_steps']} [{trend}]"
+                  )
+              lines.append("")
+
+          if hard_alerts:
+              lines.append(f"HARD REGRESSIONS ({len(hard_alerts)}):")
+              for a in hard_alerts:
+                  lines.append(f" [HARD] {a.message}")
+              lines.append("")
+
+          if soft_alerts:
+              lines.append(f"Soft regressions ({len(soft_alerts)}):")
+              for a in soft_alerts:
+                  lines.append(f" [soft] {a.message}")
+              lines.append("")
+
+          if lora_alerts:
+              lines.append(f"LoRA injection alerts ({len(lora_alerts)}):")
+              for la in lora_alerts:
+                  lines.append(f" [LoRA] {la}")
+              lines.append("")
+
+          if not hard_alerts and not lora_alerts:
+              lines.append("No hard regressions detected. All recursive loops healthy.")
+
+          report = "\n".join(lines)
+          print(report)
+
+          has_hard = len(hard_alerts) > 0 or len(lora_alerts) > 0
+          with open(os.environ["GITHUB_OUTPUT"], "a") as gh_out:
+              gh_out.write(f"hard_regression={str(has_hard).lower()}\n")
+              report_escaped = report.replace("\n", "%0A")
+              gh_out.write(f"regression_report={report_escaped}\n")
+              gh_out.write(f"run_url={run_url}\n")
+
+          if has_hard:
+              sys.exit(1)
+          PYEOF
+
+      - name: Upload weekly report artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-regression-report-${{ github.run_id }}
+          path: results/
+          if-no-files-found: ignore
+          retention-days: 30

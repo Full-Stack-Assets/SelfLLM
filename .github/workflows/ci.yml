@@ -1,0 +1,158 @@
+name: CI — Test Suite
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  unit-tests:
+    name: Unit Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch==2.2.2+cpu --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy==1.26.4
+          pip install -e ".[dev]"
+
+      - name: Run unit tests with coverage (fast, no slow)
+        run: |
+          pytest tests/ -q --tb=short \
+            --cov=selfllm \
+            --cov-report=term-missing:skip-covered \
+            --cov-report=xml:coverage.xml \
+            --cov-fail-under=78
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-py${{ matrix.python-version }}
+          path: |
+            .pytest_cache/
+            coverage.xml
+          retention-days: 7
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install lint tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff==0.4.4
+
+      - name: Run ruff
+        run: ruff check selfllm/ tests/ --select=E,F,W --ignore=E501,E402
+
+  eval-smoke:
+    name: Eval Suite Smoke Test
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch==2.2.2+cpu --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy==1.26.4
+          pip install -e ".[dev]"
+
+      - name: Run eval tests only
+        run: pytest tests/test_eval.py -v --tb=short
+
+      - name: Smoke-test eval module import
+        run: |
+          python - <<'PY'
+          from selfllm.eval import (
+              BenchmarkSuite,
+              SuiteResult,
+              RegressionDetector,
+              RegressionAlert,
+              MMLUBenchmark,
+              GSM8KBenchmark,
+              HumanEvalBenchmark,
+              Evaluator,
+              EvalResult,
+              run_all,
+          )
+          print("All eval imports OK")
+          PY
+
+  benchmark-smoke:
+    name: Benchmark Suite Smoke Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch==2.2.2+cpu --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy==1.26.4
+          pip install -e ".[dev]"
+
+      - name: Run benchmark suite smoke test
+        run: python scripts/run_benchmark_smoke.py
+
+      - name: Upload smoke-test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-snapshot-py${{ matrix.python-version }}-${{ github.sha }}
+          path: /tmp/selfllm_smoke_*/
+          retention-days: 7

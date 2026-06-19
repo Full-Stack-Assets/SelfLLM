@@ -6,6 +6,11 @@ test_checkpoints/
 __pycache__/
 *.egg-info/
 
+# Coverage artifacts
+.coverage
+coverage.xml
+htmlcov/
+
 # Training / serving outputs
 checkpoints/
 logs/

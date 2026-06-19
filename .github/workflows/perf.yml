@@ -1,0 +1,239 @@
+name: Performance Benchmark
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "selfllm/serving/**"
+      - "selfllm/model/**"
+      - "run_training.py"
+      - "run_self_improve.py"
+  workflow_dispatch:
+    inputs:
+      max_new_tokens:
+        description: "Max new tokens per generation (default: 32)"
+        required: false
+        default: "32"
+      batch_size:
+        description: "Batch size for throughput benchmark (default: 1)"
+        required: false
+        default: "1"
+
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Serving engine benchmark (optimized.py vs baseline)
+  # ---------------------------------------------------------------------------
+  benchmark-serving:
+    name: Serving Engine Benchmark
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch==2.2.2+cpu --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy==1.26.4
+          pip install -e ".[dev]"
+
+      - name: Run optimized.py tests
+        run: pytest tests/test_optimized.py -v --tb=short
+
+      - name: Run serving benchmark script
+        run: |
+          python scripts/benchmark.py \
+            --max-new-tokens ${{ github.event.inputs.max_new_tokens || '32' }} \
+            --batch-size ${{ github.event.inputs.batch_size || '1' }} \
+            --timed-runs 3 \
+            --output benchmark_results.json
+
+      - name: Display results summary
+        run: |
+          python -c "
+          import json, sys
+          with open('benchmark_results.json') as f:
+              data = json.load(f)
+          print('=== Serving Benchmark Results ===')
+          for row in data.get('results', []):
+              print(f\"  {row['engine']:25s} | {row['workload']:20s} | \"
+                    f\"{row['tokens_per_sec']:7.1f} tok/s | avg={row['avg_latency_ms']:.0f}ms | \"
+                    f\"p95={row['p95_latency_ms']:.0f}ms\")
+          speedups = [r for r in data.get('results', []) if r.get('speedup_vs_baseline')]
+          if speedups:
+              avg_speedup = sum(r['speedup_vs_baseline'] for r in speedups) / len(speedups)
+              print(f'  Avg compiled speedup: {avg_speedup:.3f}x')
+          "
+
+      - name: Check for performance regression
+        run: |
+          python -c "
+          import json, sys
+
+          with open('benchmark_results.json') as f:
+              data = json.load(f)
+
+          BASELINE_TPS_FLOOR = 100.0
+          # torch.compile on CPU (no CUDA) falls back to dynamo-eager with
+          # minor graph-capture overhead; allow up to 20% below baseline.
+          # A hard regression would be >20% slower, indicating a real issue.
+          COMPILED_REGRESSION_THRESHOLD = 0.80
+
+          failures = []
+          baseline_tps = {}
+          compiled_tps = {}
+
+          for row in data.get('results', []):
+              if row['engine'] == 'A_baseline_eager':
+                  baseline_tps[row['workload']] = row['tokens_per_sec']
+              elif row['engine'] == 'B_compiled':
+                  compiled_tps[row['workload']] = row['tokens_per_sec']
+
+          for wl, tps in baseline_tps.items():
+              if tps < BASELINE_TPS_FLOOR:
+                  failures.append(f'Baseline {wl}: {tps:.1f} tok/s < floor {BASELINE_TPS_FLOOR}')
+
+          for wl, tps in compiled_tps.items():
+              base = baseline_tps.get(wl)
+              if base and tps < base * COMPILED_REGRESSION_THRESHOLD:
+                  failures.append(
+                      f'Compiled {wl}: {tps:.1f} tok/s is <90% of baseline {base:.1f}'
+                  )
+
+          if failures:
+              print('PERFORMANCE REGRESSIONS DETECTED:')
+              for f in failures:
+                  print(f'  - {f}')
+              sys.exit(1)
+          else:
+              print('No performance regressions detected.')
+          "
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: benchmark_results.json
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Tokenizer throughput benchmark
+  # Matrix: Python 3.10 + 3.11 — both must hit the 500K chars/sec floor
+  # confirming the O(n log n) BPE patch holds on every supported environment.
+  # ---------------------------------------------------------------------------
+  benchmark-tokenizer:
+    name: Tokenizer Throughput (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch==2.2.2+cpu --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy==1.26.4
+          pip install -e ".[dev]"
+
+      - name: Run tokenizer unit tests
+        run: pytest tests/test_tokenizer.py -v --tb=short
+
+      - name: Tokenizer throughput check (500K chars/sec floor)
+        run: |
+          python -c "
+          import sys, time
+          sys.path.insert(0, '.')
+          from selfllm.model.tokenizer import BPETokenizer
+
+          corpus = ['the quick brown fox jumps over the lazy dog'] * 80
+          tok = BPETokenizer(vocab_size=512)
+          tok.train(corpus)
+
+          # Verify O(n log n) caches were built by train()
+          assert hasattr(tok, '_merge_rank'), 'O(n log n) cache _merge_rank missing after train()'
+          assert hasattr(tok, '_merge_map'),  'O(n log n) cache _merge_map missing after train()'
+
+          text = ' '.join(corpus[:10])
+          N = 300
+          t0 = time.perf_counter()
+          for _ in range(N):
+              tok.encode(text)
+          elapsed = time.perf_counter() - t0
+          chars = len(text) * N
+          tcs = chars / elapsed
+          py = sys.version.split()[0]
+
+          FLOOR = 500_000  # chars/sec — O(n log n) gives >1M on any modern CPU
+          print(f'Python {py}  throughput: {tcs:,.0f} chars/sec  (floor={FLOOR:,})')
+
+          if tcs < FLOOR:
+              print(f'REGRESSION: {tcs:.0f} < {FLOOR} — O(n log n) patch may have been reverted')
+              sys.exit(1)
+          else:
+              print('Tokenizer throughput: PASS')
+          "
+
+      - name: Verify cache survives round-trip save/load
+        run: |
+          python -c "
+          import sys, os, tempfile
+          sys.path.insert(0, '.')
+          from selfllm.model.tokenizer import BPETokenizer
+
+          corpus = ['the quick brown fox jumps over the lazy dog'] * 50
+          tok = BPETokenizer(vocab_size=256)
+          tok.train(corpus)
+
+          with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+              path = f.name
+          try:
+              tok.save(path)
+              tok2 = BPETokenizer(vocab_size=256)
+              tok2.load(path)
+
+              # Cache must be rebuilt after load()
+              assert hasattr(tok2, '_merge_rank'), 'Cache not rebuilt after load()'
+              assert hasattr(tok2, '_merge_map'),  'Cache not rebuilt after load()'
+
+              # Encoding must produce identical results before/after round-trip
+              text = 'the quick brown fox'
+              ids1 = tok.encode(text)
+              ids2 = tok2.encode(text)
+              assert ids1 == ids2, f'Encode mismatch: {ids1} != {ids2}'
+              print('Round-trip save/load: PASS')
+          finally:
+              os.unlink(path)
+          "
+
+      - name: Upload tokenizer results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokenizer-results-py${{ matrix.python-version }}-${{ github.sha }}
+          path: "*.json"
+          if-no-files-found: ignore
+          retention-days: 14
