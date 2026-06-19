@@ -101,8 +101,23 @@ class ContinuousBatchingScheduler:
         self._shutdown = False
         self._total_requests_served = 0
 
-        # Per-request KV cache state: req.id -> {"past": [(k, v), ...], "cache_len": int}
+        # Per-request KV cache state. Each entry holds the request's KV cache,
+        # the *physical* cache length (bounded under sliding-window eviction),
+        # and the true *absolute* position of the next token (monotonic, used
+        # for RoPE so the kept window stays positionally correct).
+        #   req.id -> {"past": [(k, v), ...], "cache_len": int, "abs_pos": int}
         self._req_cache: Dict[str, Dict[str, Any]] = {}
+
+        # StreamingLLM-style sliding-window KV eviction. When the model is
+        # configured with a sliding window, each request's decode cache is
+        # trimmed to ``attention_sinks`` initial + ``sliding_window`` recent
+        # keys, bounding per-request memory to O(window) so the server can hold
+        # unbounded (multi-turn / long-running) conversations without the cache
+        # growing without bound.
+        cfg = getattr(model, "config", None)
+        self._window = getattr(cfg, "sliding_window", None)
+        self._sinks = getattr(cfg, "attention_sinks", 0)
+        self._use_evict = bool(self._window)
 
     def add_request(self, request: Request) -> None:
         """Thread-safe add request to waiting queue.
@@ -262,7 +277,17 @@ class ContinuousBatchingScheduler:
         past = out["past_key_values"]
         logits = out["logits"][0, -1]
         token = self._sample(logits, req)
-        self._req_cache[req.id] = {"past": past, "cache_len": past[0][0].shape[2]}
+        # The next token's absolute position is the number of prompt tokens
+        # processed; this stays monotonic even after the physical cache is
+        # trimmed by sliding-window eviction below.
+        abs_pos = past[0][0].shape[2]
+        if self._use_evict:
+            past = self.model._evict_kv_cache(past, self._sinks, self._window)
+        self._req_cache[req.id] = {
+            "past": past,
+            "cache_len": past[0][0].shape[2],
+            "abs_pos": abs_pos,
+        }
         req.generated_tokens.append(token)
         req.block_ids = self.block_manager.append_token(req.block_ids)
 
@@ -291,7 +316,12 @@ class ContinuousBatchingScheduler:
         tokens = torch.tensor(
             [[r.generated_tokens[-1]] for r in reqs], device=self.device
         )
-        positions = torch.tensor([[ln] for ln in lens], device=self.device)
+        # RoPE positions are the *absolute* positions of each new token, which
+        # diverge from the physical cache length ``ln`` once sliding-window
+        # eviction has trimmed the cache. Using the true position keeps the new
+        # token positionally consistent with the retained recent-window keys.
+        abs_positions = [self._req_cache[r.id]["abs_pos"] for r in reqs]
+        positions = torch.tensor([[p] for p in abs_positions], device=self.device)
         ar = torch.arange(L, device=self.device)
         kpm = torch.stack([ar < ln for ln in lens])  # [B, L] bool
 
@@ -319,7 +349,18 @@ class ContinuousBatchingScheduler:
                 kk = torch.cat([k[i : i + 1, :, :ln, :], k[i : i + 1, :, L : L + 1, :]], dim=2)
                 vv = torch.cat([v[i : i + 1, :, :ln, :], v[i : i + 1, :, L : L + 1, :]], dim=2)
                 new_past.append((kk, vv))
-            self._req_cache[r.id] = {"past": new_past, "cache_len": ln + 1}
+            # Trim the freshly extended cache back under the window budget so a
+            # long-running request's memory stays bounded. The absolute position
+            # advances by one regardless of how much physical cache is retained.
+            if self._use_evict:
+                new_past = self.model._evict_kv_cache(
+                    new_past, self._sinks, self._window
+                )
+            self._req_cache[r.id] = {
+                "past": new_past,
+                "cache_len": new_past[0][0].shape[2],
+                "abs_pos": abs_positions[i] + 1,
+            }
 
     def _sample(self, logits: torch.Tensor, req: Request) -> int:
         """Sample one token id from a ``[vocab]`` logits row using req params."""
