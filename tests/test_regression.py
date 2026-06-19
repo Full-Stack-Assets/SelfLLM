@@ -285,7 +285,8 @@ def test_history_persists_across_save_and_reload(tmp_path):
 def test_reloaded_detector_continues_detecting():
     """A detector restored from disk should still flag a regression vs. the
     last persisted score (state, not just data, survives)."""
-    import tempfile, os
+    import os
+    import tempfile
 
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "hist.json")

@@ -71,7 +71,7 @@ def test_prompt_tokens_are_masked_and_response_tokens_are_not(tiny_tokenizer):
     # Response positions equal the actual input tokens (not masked).
     assert labels[n_prompt:] == input_ids[n_prompt:]
     # At least one real (un-ignored) label exists for loss to flow.
-    assert any(l != IGNORE for l in labels)
+    assert any(lab != IGNORE for lab in labels)
 
 
 def test_response_labels_match_input_ids_at_same_positions(tiny_tokenizer):
@@ -102,7 +102,7 @@ def test_eos_appended_to_response(tiny_tokenizer):
         pad_to_max=False,
     )
     item = ds[0]
-    labels = [l for l in item["labels"].tolist() if l != IGNORE]
+    labels = [lab for lab in item["labels"].tolist() if lab != IGNORE]
     # Last non-ignored label is the EOS token id.
     assert labels[-1] == tiny_tokenizer.eos_token_id
 
@@ -118,7 +118,7 @@ def test_eos_not_duplicated_when_already_present(tiny_tokenizer):
         max_seq_len=64,
         pad_to_max=False,
     )
-    labels = [l for l in ds[0]["labels"].tolist() if l != IGNORE]
+    labels = [lab for lab in ds[0]["labels"].tolist() if lab != IGNORE]
     # Exactly one EOS at the tail, none injected mid-response erroneously.
     assert labels.count(eos) == 1
     assert labels[-1] == eos
@@ -207,7 +207,7 @@ def test_oversized_prompt_still_leaves_response_token(tiny_tokenizer):
     )
     item = ds[0]
     assert item["input_ids"].shape[0] <= 16
-    assert any(l != IGNORE for l in item["labels"].tolist())
+    assert any(lab != IGNORE for lab in item["labels"].tolist())
 
 
 # ---------------------------------------------------------------------------
