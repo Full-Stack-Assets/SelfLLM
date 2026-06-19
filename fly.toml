@@ -1,37 +1,23 @@
-# Fly.io config for the SelfLLM OpenAI-compatible server.
-# Deploy:  see deploy/fly/deploy.sh  (set a unique `app` name below first).
+# fly.toml app configuration file generated for selfllm on 2026-06-18T21:33:25Z
 #
-# The trained model is baked into the image (Dockerfile COPY real_model), and
-# `fly deploy` uploads the local build context -- so the gitignored real_model/
-# is included without committing it.
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-app = "selfllm-CHANGEME"      # must be globally unique; edit before deploying
-primary_region = "iad"
+app = 'selfllm'
+primary_region = 'dfw'
 
 [build]
-  dockerfile = "Dockerfile"
-
-[env]
-  # The server listens on $PORT; keep this equal to http_service.internal_port.
-  PORT = "8080"
-  # MODEL_PATH / TOKENIZER_PATH are set in the Dockerfile (baked model).
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"     # scale to zero when idle
+  auto_stop_machines = 'stop'
   auto_start_machines = true
   min_machines_running = 0
+  processes = ['app']
 
-  [[http_service.checks]]
-    method = "get"
-    path = "/health"              # open (unauthenticated) liveness endpoint
-    interval = "30s"
-    timeout = "5s"
-    grace_period = "30s"
-
-# Torch needs real memory; the small model fits comfortably in 2GB.
 [[vm]]
-  cpu_kind = "shared"
-  cpus = 2
-  memory = "2gb"
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 256
