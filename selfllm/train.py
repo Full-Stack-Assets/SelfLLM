@@ -7,6 +7,7 @@ Provides subcommands for the full model lifecycle:
     python -m selfllm self-improve   # Run recursive self-improvement
     python -m selfllm generate       # Generate text from trained model
     python -m selfllm evaluate       # Evaluate model quality
+    python -m selfllm benchmark      # MMLU / GSM8K / HumanEval (+ reasoning lift)
     python -m selfllm serve          # Launch OpenAI-compatible API server
 
 Configuration can be provided via ``--config`` (YAML) and/or individual CLI
@@ -151,6 +152,11 @@ def merge_config(yaml_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dict
     merged["tokenizer_path"] = getattr(cli_args, "tokenizer_path", None) or yaml_cfg.get("tokenizer_path", "")
     if getattr(cli_args, "num_iterations", None) is not None:
         merged["num_iterations"] = cli_args.num_iterations
+    for _bk in ("mmlu", "gsm8k", "humaneval", "limit", "reasoning",
+                "reasoning_samples"):
+        _bv = getattr(cli_args, _bk, None)
+        if _bv is not None:
+            merged[_bk] = _bv
     merged["save_path"] = getattr(cli_args, "save_path", None) or yaml_cfg.get("save_path", "")
     merged["eval_data"] = getattr(cli_args, "eval_data", None) or yaml_cfg.get("eval_data", "")
     merged["prompt"] = getattr(cli_args, "prompt", None) or yaml_cfg.get("prompt", "")
@@ -478,6 +484,36 @@ def build_parser() -> argparse.ArgumentParser:
     ppo_parser.add_argument(
         "--num-iterations", type=int, default=None, help="Number of PPO update iterations."
     )
+
+    # ------------------------------------------------------------------
+    # benchmark (eval suite: MMLU / GSM8K / HumanEval, optional reasoning lift)
+    # ------------------------------------------------------------------
+    bench_parser = subparsers.add_parser(
+        "benchmark",
+        help="Run the MMLU / GSM8K / HumanEval eval suite on a trained model.",
+        description="Score a model on standardized benchmarks, optionally under a "
+                    "test-time reasoning strategy to measure the lift over greedy.",
+    )
+    bench_parser.add_argument("--model-path", type=str, required=True,
+                              help="Path to the model checkpoint.")
+    bench_parser.add_argument("--tokenizer-path", type=str, required=True,
+                              help="Path to the tokenizer.")
+    bench_parser.add_argument("--mmlu", type=str, default=None,
+                              help="MMLU dataset JSONL path (omit to skip).")
+    bench_parser.add_argument("--gsm8k", type=str, default=None,
+                              help="GSM8K dataset JSONL path (omit to skip).")
+    bench_parser.add_argument("--humaneval", type=str, default=None,
+                              help="HumanEval dataset JSONL path (omit to skip).")
+    bench_parser.add_argument("--limit", type=int, default=None,
+                              help="Cap examples per benchmark.")
+    bench_parser.add_argument("--reasoning", type=str, default=None,
+                              choices=["cot", "self_consistency", "best_of_n"],
+                              help="Run under a reasoning strategy and report the "
+                                   "lift over greedy.")
+    bench_parser.add_argument("--reasoning-samples", type=int, default=5,
+                              help="Samples for self_consistency / best_of_n.")
+    bench_parser.add_argument("--output-path", type=str, default=None,
+                              help="Optional JSON path to save the results.")
 
     return parser
 
@@ -961,6 +997,97 @@ def _generate_and_print(
     print(f"{'=' * 60}")
 
 
+def cmd_benchmark(cfg: Dict[str, Any], logger: Logger) -> None:
+    """Run the MMLU / GSM8K / HumanEval eval suite on a trained model."""
+    from selfllm.eval import (
+        GSM8KBenchmark, HumanEvalBenchmark, MMLUBenchmark,
+        Evaluator, comparison_report,
+    )
+    from selfllm.model.model import SelfImprovingLLM
+    from selfllm.model.tokenizer import BPETokenizer
+
+    model_path = cfg.get("model_path", "")
+    tokenizer_path = cfg.get("tokenizer_path", "")
+    if not model_path or not Path(model_path).exists():
+        logger.error(f"Model path not found: {model_path}")
+        sys.exit(1)
+    if not tokenizer_path or not Path(tokenizer_path).exists():
+        logger.error(f"Tokenizer path not found: {tokenizer_path}")
+        sys.exit(1)
+
+    logger.info("Loading model and tokenizer for benchmarking...")
+    model = SelfImprovingLLM.from_pretrained(model_path).to(cfg["device"]).eval()
+    tokenizer = BPETokenizer(vocab_size=cfg["model"].get("vocab_size", 32000))
+    tokenizer.load(tokenizer_path)
+
+    # Build the requested benchmarks (those with a dataset path).
+    specs = [
+        ("mmlu", MMLUBenchmark, "choice"),
+        ("gsm8k", GSM8KBenchmark, "numeric"),
+        ("humaneval", HumanEvalBenchmark, None),
+    ]
+    evaluator = Evaluator()
+    answer_types: Dict[str, str] = {}
+    for key, cls, ans_type in specs:
+        path = cfg.get(key)
+        if path:
+            if not Path(path).exists():
+                logger.error(f"{key} dataset not found: {path}")
+                sys.exit(1)
+            evaluator.add(cls.from_source(path))
+            if ans_type:
+                answer_types[cls.__name__.replace("Benchmark", "").lower()] = ans_type
+    if not evaluator.benchmarks:
+        logger.error("No benchmarks selected. Provide at least one of "
+                     "--mmlu / --gsm8k / --humaneval.")
+        sys.exit(1)
+
+    limit = cfg.get("limit")
+    common = {"limit": limit} if limit is not None else {}
+
+    logger.info(f"Running {len(evaluator.benchmarks)} benchmark(s) (greedy)...")
+    baseline = evaluator.run(model, tokenizer, **common)
+    report: Dict[str, Any] = {"greedy": comparison_report(baseline)}
+    logger.info("\n" + comparison_report(baseline, as_string=True))
+
+    # Optional: run under a reasoning strategy and report the lift.
+    reasoning = cfg.get("reasoning")
+    if reasoning:
+        from selfllm.reasoning import (
+            BestOfNStrategy, CoTStrategy, SelfConsistencyStrategy,
+            SelfConsistencyVerifier,
+        )
+
+        n = cfg.get("reasoning_samples", 5)
+        logger.info(f"Running under reasoning strategy '{reasoning}'...")
+        strat_results = []
+        for bench in evaluator.benchmarks:
+            ans_type = answer_types.get(bench.name, "free")
+            if reasoning == "cot":
+                strat = CoTStrategy(model, tokenizer, answer_type=ans_type,
+                                    device=cfg["device"])
+            elif reasoning == "best_of_n":
+                strat = BestOfNStrategy(model, tokenizer, SelfConsistencyVerifier(),
+                                        answer_type=ans_type, num_samples=n,
+                                        device=cfg["device"])
+            else:
+                strat = SelfConsistencyStrategy(model, tokenizer, answer_type=ans_type,
+                                                num_samples=n, device=cfg["device"])
+            strat_results.append(bench.evaluate(model, tokenizer, strategy=strat,
+                                                **common))
+        report[reasoning] = comparison_report(strat_results)
+        logger.info("\n" + comparison_report(strat_results, as_string=True))
+        for b, s in zip(baseline, strat_results):
+            logger.info(f"  {b.name} lift ({reasoning} - greedy): "
+                        f"{s.score - b.score:+.4f}")
+
+    output_path = cfg.get("output_path")
+    if output_path:
+        from selfllm.utils import save_json
+        save_json(report, output_path)
+        logger.info(f"Results saved to {output_path}")
+
+
 def cmd_evaluate(cfg: Dict[str, Any], logger: Logger) -> None:
     """Evaluate model quality."""
     from selfllm.model.model import SelfImprovingLLM
@@ -1106,6 +1233,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "real-training": cmd_real_training,
         "generate": cmd_generate,
         "evaluate": cmd_evaluate,
+        "benchmark": cmd_benchmark,
         "serve": cmd_serve,
     }
 
