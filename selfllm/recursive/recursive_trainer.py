@@ -312,6 +312,15 @@ class RecursiveSelfTrainer:
                 )
                 print(f"[Step 7/7] Saving checkpoint to {checkpoint_path} ...")
                 self.model.save_pretrained(checkpoint_path)
+                # Persist the reward model alongside the policy so it survives
+                # restarts and rollbacks (kept consistent with this checkpoint).
+                if self.reward_trainer is not None:
+                    try:
+                        self.reward_trainer.save(
+                            os.path.join(checkpoint_path, "reward_model.pt")
+                        )
+                    except Exception as e:  # pragma: no cover - defensive guard
+                        print(f"  ⚠️  Failed to save reward model ({e}); continuing.")
                 self.best_checkpoint_path = checkpoint_path
 
                 # Enforce the checkpoint retention policy.
@@ -330,6 +339,17 @@ class RecursiveSelfTrainer:
 
             self.model = SelfImprovingLLM.from_pretrained(self.best_checkpoint_path)
             self.model.to(self.device)
+
+            # Roll the reward model back to the same checkpoint, if one was saved.
+            if self.reward_trainer is not None:
+                reward_path = os.path.join(
+                    self.best_checkpoint_path, "reward_model.pt"
+                )
+                if os.path.exists(reward_path):
+                    try:
+                        self.reward_trainer.load(reward_path)
+                    except Exception as e:  # pragma: no cover - defensive guard
+                        print(f"  ⚠️  Failed to reload reward model ({e}); continuing.")
 
             # Re-create evaluator with rolled-back model
             self.evaluator = SelfImprovementEvaluator(
