@@ -1,19 +1,5 @@
 name: Training Monitor
 
-# Monitors performance metrics produced by training and self-improvement runs.
-# Triggered on three paths:
-#   1. push     — any change to results/ or run_output/ on main
-#   2. schedule — every Saturday at 06:00 UTC (= Saturday midnight EDT)
-#                 so results are ready before Monday's training cycle
-#   3. workflow_dispatch — manual trigger with optional path overrides
-#
-# Jobs:
-#   validate-training  — validates training_summary.json schema + loss trends
-#   regression-check   — runs RegressionDetector over all results/eval_*.json
-#   serving-metrics    — checks benchmark_raw.json for zero-throughput
-#   weekly-summary     — (schedule only) scans past 7 days; flags hard
-#                        regressions in perplexity and LoRA injection health
-
 on:
   push:
     branches: [main]
@@ -22,7 +8,6 @@ on:
       - "run_output/**"
   schedule:
     # Saturday 06:00 UTC = Saturday midnight EDT
-    # Results are ready before Monday's training cycle starts
     - cron: "0 6 * * 6"
   workflow_dispatch:
     inputs:
@@ -40,13 +25,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Validate training summary JSON and loss curves
-  # ---------------------------------------------------------------------------
   validate-training:
     name: Validate Training Metrics
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -57,14 +38,16 @@ jobs:
           python-version: "3.11"
 
       - name: Validate training_summary.json
+        env:
+          SUMMARY_PATH: ${{ github.event_name == 'workflow_dispatch' && inputs.summary_path || 'results/training_summary.json' }}
         run: |
           python - <<'PYEOF'
           import json, sys, os
 
-          SUMMARY = '${{ github.event.inputs.summary_path || "results/training_summary.json" }}'
+          SUMMARY = os.environ["SUMMARY_PATH"]
 
           if not os.path.exists(SUMMARY):
-              print(f'WARNING: {SUMMARY} not found — skipping training validation')
+              print(f"WARNING: {SUMMARY} not found — skipping training validation")
               sys.exit(0)
 
           with open(SUMMARY) as f:
@@ -72,68 +55,59 @@ jobs:
 
           errors = []
 
-          # Required top-level keys
-          for key in ('model_params', 'pretrain', 'lora', 'self_improvement'):
+          for key in ("model_params", "pretrain", "lora", "self_improvement"):
               if key not in s:
-                  errors.append(f'Missing key: {key}')
+                  errors.append(f"Missing key: {key}")
 
           if not errors:
-              # Pre-training loss should be monotonically decreasing
-              pretrain   = s.get('pretrain', {})
-              loss_hist  = pretrain.get('loss_history', [])
+              pretrain = s.get("pretrain", {})
+              loss_hist = pretrain.get("loss_history", [])
               if len(loss_hist) >= 2:
                   for i in range(1, len(loss_hist)):
-                      if loss_hist[i] >= loss_hist[i-1]:
-                          print(f'WARNING: Pre-training loss did not decrease at epoch {i+1}: '
-                                f'{loss_hist[i-1]:.4f} -> {loss_hist[i]:.4f}')
+                      if loss_hist[i] >= loss_hist[i - 1]:
+                          print(
+                              f"WARNING: Pre-training loss did not decrease at epoch {i+1}: "
+                              f"{loss_hist[i-1]:.4f} -> {loss_hist[i]:.4f}"
+                          )
 
-              # Self-improvement: check at least some iterations ran
-              si    = s.get('self_improvement', {})
-              iters = si.get('iterations_run', 0)
+              si = s.get("self_improvement", {})
+              iters = si.get("iterations_run", 0)
               if iters == 0:
-                  errors.append('self_improvement.iterations_run = 0')
+                  errors.append("self_improvement.iterations_run = 0")
 
-              # Model size sanity check
-              params = s.get('model_params', 0)
+              params = s.get("model_params", 0)
               if params < 100_000:
-                  errors.append(f'Suspiciously small model: {params} params')
+                  errors.append(f"Suspiciously small model: {params} params")
 
-              # LoRA: trainable should be < 10% of total
-              lora     = s.get('lora', {})
-              lora_pct = lora.get('lora_pct', 0.0)
+              lora = s.get("lora", {})
+              lora_pct = lora.get("lora_pct", 0.0)
               if lora_pct > 10.0:
-                  errors.append(f'LoRA trainable% too high: {lora_pct:.1f}% (expected <10%)')
+                  errors.append(f"LoRA trainable% too high: {lora_pct:.1f}% (expected <10%)")
 
-          print('=== Training Summary Validation ===')
-          print(f'  Model params     : {s.get("model_params", "N/A"):,}')
-          pt = s.get('pretrain', {})
-          print(f'  Pretrain epochs  : {pt.get("epochs", "N/A")}')
-          lh = pt.get('loss_history', [])
+          print("=== Training Summary Validation ===")
+          print(f"Model params: {s.get('model_params', 'N/A'):,}")
+          pt = s.get("pretrain", {})
+          print(f"Pretrain epochs: {pt.get('epochs', 'N/A')}")
+          lh = pt.get("loss_history", [])
           if lh:
-              print(f'  Pretrain losses  : {" → ".join(f"{x:.4f}" for x in lh)}')
-          si = s.get('self_improvement', {})
-          print(f'  SI iterations    : {si.get("iterations_run", "N/A")}')
-          print(f'  SI duration      : {si.get("duration_s", "N/A")}s')
-          print(f'  Loss improvement : {si.get("loss_improvement_pct", "N/A")}%')
+              print("Pretrain losses:", " -> ".join(f"{x:.4f}" for x in lh))
+          si = s.get("self_improvement", {})
+          print(f"SI iterations: {si.get('iterations_run', 'N/A')}")
+          print(f"SI duration: {si.get('duration_s', 'N/A')}s")
+          print(f"Loss improvement: {si.get('loss_improvement_pct', 'N/A')}%")
 
           if errors:
-              print()
-              print('VALIDATION ERRORS:')
+              print("\nVALIDATION ERRORS:")
               for e in errors:
-                  print(f'  - {e}')
+                  print(f" - {e}")
               sys.exit(1)
           else:
-              print()
-              print('Validation PASSED')
+              print("\nValidation PASSED")
           PYEOF
 
-  # ---------------------------------------------------------------------------
-  # Check eval snapshot regressions across results/ directory
-  # ---------------------------------------------------------------------------
   regression-check:
     name: Regression Detection
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -155,66 +129,65 @@ jobs:
         run: |
           python - <<'PYEOF'
           import json, os, sys, glob
+          from selfllm.eval.regression import RegressionDetector
+          from selfllm.eval.suite import SuiteResult
+          from selfllm.eval.harness import EvalResult
 
-          # Find all eval_*.json snapshots in results/
-          snapshots = sorted(glob.glob('results/eval_*.json'))
+          snapshots = sorted(glob.glob("results/eval_*.json"))
           if not snapshots:
-              print('No eval snapshots found in results/ — skipping regression check')
+              print("No eval snapshots found in results/ — skipping regression check")
               sys.exit(0)
 
-          print(f'Found {len(snapshots)} eval snapshot(s)')
-
-          from selfllm.eval.regression import RegressionDetector
-          from selfllm.eval.suite      import SuiteResult
-          from selfllm.eval.harness    import EvalResult
-
-          detector   = RegressionDetector(hard_threshold=0.05, soft_threshold=0.02, patience=3)
+          print(f"Found {len(snapshots)} eval snapshot(s)")
+          detector = RegressionDetector(hard_threshold=0.05, soft_threshold=0.02, patience=3)
           all_alerts = []
 
           for path in snapshots:
               with open(path) as f:
                   data = json.load(f)
+
               results = [
                   EvalResult(
-                      name    = r['name'],
-                      score   = r['score'],
-                      n       = r['n'],
-                      details = r.get('details', {}),
+                      name=r["name"],
+                      score=r["score"],
+                      n=r["n"],
+                      details=r.get("details", {}),
                   )
-                  for r in data.get('results', [])
+                  for r in data.get("results", [])
               ]
+
               suite_result = SuiteResult(
-                  tag       = data.get('tag', os.path.basename(path)),
-                  timestamp = data.get('timestamp', 0),
-                  results   = results,
-                  elapsed_s = data.get('elapsed_s', 0),
+                  tag=data.get("tag", os.path.basename(path)),
+                  timestamp=data.get("timestamp", 0),
+                  results=results,
+                  elapsed_s=data.get("elapsed_s", 0),
               )
+
               alerts = detector.update(suite_result)
               all_alerts.extend(alerts)
 
-          print()
-          print('=== Regression Summary ===')
+          print("\n=== Regression Summary ===")
           summary = detector.summary()
           for name, info in summary.items():
-              print(f'  {name}: latest={info["latest"]:.3f}  best={info["best"]:.3f}  steps={info["n_steps"]}')
+              print(
+                  f" {name}: latest={info['latest']:.3f} "
+                  f"best={info['best']:.3f} steps={info['n_steps']}"
+              )
 
           if all_alerts:
-              print()
-              print(f'REGRESSIONS DETECTED ({len(all_alerts)}):')
+              print(f"\nREGRESSIONS DETECTED ({len(all_alerts)}):")
               for a in all_alerts:
-                  print(f'  [{a.severity.upper()}] {a.message}')
-              hard = [a for a in all_alerts if a.severity == 'hard']
+                  print(f" [{a.severity.upper()}] {a.message}")
+
+              hard = [a for a in all_alerts if a.severity == "hard"]
               if hard:
-                  sys.exit(1)   # Hard regressions fail the workflow
+                  sys.exit(1)
               else:
-                  print('(Only soft regressions — workflow passes with warning)')
+                  print("(Only soft regressions — workflow passes with warning)")
           else:
-              print('No regressions detected.')
+              print("No regressions detected.")
           PYEOF
 
-  # ---------------------------------------------------------------------------
-  # Serving engine metrics check
-  # ---------------------------------------------------------------------------
   serving-metrics:
     name: Serving Metrics Monitor
     runs-on: ubuntu-latest
@@ -222,7 +195,6 @@ jobs:
       contains(github.event.head_commit.message, 'training') ||
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'schedule'
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -233,77 +205,53 @@ jobs:
           python-version: "3.11"
 
       - name: Check benchmark_raw.json (if present)
+        env:
+          BENCHMARK_PATH: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_path || 'results/benchmark_raw.json' }}
         run: |
           python - <<'PYEOF'
           import json, os, sys
 
-          BENCH = '${{ github.event.inputs.benchmark_path || "results/benchmark_raw.json" }}'
+          BENCH = os.environ["BENCHMARK_PATH"]
 
           if not os.path.exists(BENCH):
-              print(f'benchmark_raw.json not found at {BENCH} — skipping serving metrics check')
+              print(f"benchmark_raw.json not found at {BENCH} — skipping serving metrics check")
               sys.exit(0)
 
           with open(BENCH) as f:
               rows = json.load(f)
 
-          print('=== Serving Engine Metrics ===')
+          print("=== Serving Engine Metrics ===")
           baseline_tps = {}
+
           for row in rows:
-              eng = row.get('engine', '')
-              wl  = row.get('workload', '')
-              tps = row.get('tokens_per_sec', 0)
-              avg = row.get('avg_latency_s', 0) * 1000
-              p95 = row.get('p95_latency_s', 0) * 1000
-              print(f'  {eng:25s} | {wl:20s} | {tps:7.1f} tok/s | avg={avg:.0f}ms p95={p95:.0f}ms')
-              if eng == 'A_baseline_eager':
+              eng = row.get("engine", "")
+              wl = row.get("workload", "")
+              tps = row.get("tokens_per_sec", 0)
+              avg = row.get("avg_latency_s", 0) * 1000
+              p95 = row.get("p95_latency_s", 0) * 1000
+              print(f" {eng:25s} | {wl:20s} | {tps:7.1f} tok/s | avg={avg:.0f}ms p95={p95:.0f}ms")
+
+              if eng == "A_baseline_eager":
                   baseline_tps[wl] = tps
 
-          # Check no workload has zero throughput (indicates a hang/crash)
-          zero_tps = [r for r in rows if r.get('tokens_per_sec', 0) < 1.0]
+          zero_tps = [r for r in rows if r.get("tokens_per_sec", 0) < 1.0]
           if zero_tps:
-              print()
-              print('ERROR: Zero-throughput results detected:')
+              print("\nERROR: Zero-throughput results detected:")
               for r in zero_tps:
-                  print(f'  {r["engine"]} / {r["workload"]}')
+                  print(f" {r['engine']} / {r['workload']}")
               sys.exit(1)
           else:
-              print()
-              print('All serving metrics look healthy.')
+              print("\nAll serving metrics look healthy.")
           PYEOF
 
-  # ---------------------------------------------------------------------------
-  # Weekly summary — runs ONLY on the Saturday 06:00 UTC schedule trigger.
-  #
-  # Scans every eval_*.json snapshot written in the past 7 days, runs
-  # RegressionDetector across the full ordered history, and inspects
-  # training_summary.json for LoRA injection health.
-  #
-  # Hard regression definition (matches RegressionDetector defaults):
-  #   ≥5 pp single-step drop on any benchmark  (hard_threshold = 0.05)
-  #   Sustained ≥2 pp drop for ≥3 steps        (soft + patience = 3)
-  # LoRA injection regression:
-  #   last_iter_loss > first_iter_loss × 1.20  (≥20% loss increase)
-  #
-  # Outputs (consumed by downstream notification cron):
-  #   hard_regression   — "true" | "false"
-  #   regression_report — full text summary (newlines URL-encoded as %0A)
-  #   run_url           — direct link to this Actions run
-  #
-  # Exit codes:
-  #   0   No hard regressions found
-  #   1   At least one hard regression — sets hard_regression=true
-  # ---------------------------------------------------------------------------
   weekly-summary:
     name: Weekly Regression Summary
     runs-on: ubuntu-latest
-    # Only execute on the Saturday schedule; skip for push / workflow_dispatch
     if: github.event_name == 'schedule'
-
     outputs:
-      hard_regression:   ${{ steps.scan.outputs.hard_regression }}
+      hard_regression: ${{ steps.scan.outputs.hard_regression }}
       regression_report: ${{ steps.scan.outputs.regression_report }}
-      run_url:           ${{ steps.scan.outputs.run_url }}
-
+      run_url: ${{ steps.scan.outputs.run_url }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -329,162 +277,142 @@ jobs:
         run: |
           python - <<'PYEOF'
           import json, os, sys, glob, time
+          from datetime import datetime, timezone
+          from selfllm.eval.regression import RegressionDetector
+          from selfllm.eval.suite import SuiteResult
+          from selfllm.eval.harness import EvalResult
 
-          # ------------------------------------------------------------------ #
-          # 1. Discover eval snapshots from the past 7 days                     #
-          # ------------------------------------------------------------------ #
-          now_ts   = time.time()
+          now_ts = time.time()
           week_ago = now_ts - 7 * 24 * 3600
+          all_snaps = sorted(glob.glob("results/eval_*.json"))
+          recent = []
 
-          all_snaps = sorted(glob.glob('results/eval_*.json'))
-          recent    = []
           for path in all_snaps:
               try:
                   mtime = os.path.getmtime(path)
                   with open(path) as f:
                       data = json.load(f)
-                  ts = data.get('timestamp', mtime)
+                  ts = data.get("timestamp", mtime)
                   if ts >= week_ago:
                       recent.append((ts, path, data))
               except Exception as exc:
-                  print(f'WARNING: could not parse {path}: {exc}')
+                  print(f"WARNING: could not parse {path}: {exc}")
 
           recent.sort(key=lambda x: x[0])
 
-          gh_repo   = os.environ.get('GH_REPO', '')
-          gh_run_id = os.environ.get('GH_RUN_ID', '')
-          run_url   = f'https://github.com/{gh_repo}/actions/runs/{gh_run_id}'
+          gh_repo = os.environ.get("GH_REPO", "")
+          gh_run_id = os.environ.get("GH_RUN_ID", "")
+          run_url = f"https://github.com/{gh_repo}/actions/runs/{gh_run_id}"
 
-          print(f'Weekly scan: {len(recent)} snapshot(s) in the past 7 days')
+          print(f"Weekly scan: {len(recent)} snapshot(s) in the past 7 days")
 
           if not recent:
-              print('No snapshots this week — nothing to scan')
-              with open(os.environ['GITHUB_OUTPUT'], 'a') as gh_out:
-                  gh_out.write('hard_regression=false\n')
-                  gh_out.write('regression_report=No eval snapshots found for the past 7 days.\n')
-                  gh_out.write(f'run_url={run_url}\n')
+              print("No snapshots this week — nothing to scan")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as gh_out:
+                  gh_out.write("hard_regression=false\n")
+                  gh_out.write("regression_report=No eval snapshots found for the past 7 days.\n")
+                  gh_out.write(f"run_url={run_url}\n")
               sys.exit(0)
 
-          # ------------------------------------------------------------------ #
-          # 2. Feed all snapshots into RegressionDetector (ordered by time)     #
-          # ------------------------------------------------------------------ #
-          from selfllm.eval.regression import RegressionDetector
-          from selfllm.eval.suite      import SuiteResult
-          from selfllm.eval.harness    import EvalResult
-
-          detector   = RegressionDetector(hard_threshold=0.05, soft_threshold=0.02, patience=3)
+          detector = RegressionDetector(hard_threshold=0.05, soft_threshold=0.02, patience=3)
           all_alerts = []
 
           for ts, path, data in recent:
               results = [
                   EvalResult(
-                      name    = r['name'],
-                      score   = r['score'],
-                      n       = r['n'],
-                      details = r.get('details', {}),
+                      name=r["name"],
+                      score=r["score"],
+                      n=r["n"],
+                      details=r.get("details", {}),
                   )
-                  for r in data.get('results', [])
+                  for r in data.get("results", [])
               ]
+
               suite_result = SuiteResult(
-                  tag       = data.get('tag', os.path.basename(path)),
-                  timestamp = ts,
-                  results   = results,
-                  elapsed_s = data.get('elapsed_s', 0),
+                  tag=data.get("tag", os.path.basename(path)),
+                  timestamp=ts,
+                  results=results,
+                  elapsed_s=data.get("elapsed_s", 0),
               )
               alerts = detector.update(suite_result)
               all_alerts.extend(alerts)
 
-          # ------------------------------------------------------------------ #
-          # 3. Inspect LoRA injection health from training_summary.json         #
-          # ------------------------------------------------------------------ #
           lora_alerts = []
-          summary_path = 'results/training_summary.json'
+          summary_path = "results/training_summary.json"
           if os.path.exists(summary_path):
               with open(summary_path) as f:
                   summary_data = json.load(f)
 
-              si         = summary_data.get('self_improvement', {})
-              first_loss = si.get('first_iter_loss', 0.0)
-              last_loss  = si.get('last_iter_loss', 0.0)
+              si = summary_data.get("self_improvement", {})
+              first_loss = si.get("first_iter_loss", 0.0)
+              last_loss = si.get("last_iter_loss", 0.0)
 
-              # Flag if SI loss increased by ≥20% (LoRA degradation signal)
               if first_loss > 0 and last_loss > first_loss * 1.20:
                   pct = ((last_loss / first_loss) - 1) * 100
                   lora_alerts.append(
-                      f'LoRA injection degraded: SI loss {first_loss:.4f} -> '
-                      f'{last_loss:.4f} (+{pct:.1f}%)'
+                      f"LoRA injection degraded: SI loss {first_loss:.4f} -> "
+                      f"{last_loss:.4f} (+{pct:.1f}%)"
                   )
 
-              # LoRA parameter ratio should stay under 10%
-              lora_pct = summary_data.get('lora', {}).get('lora_pct', 0.0)
+              lora_pct = summary_data.get("lora", {}).get("lora_pct", 0.0)
               if lora_pct > 10.0:
-                  lora_alerts.append(f'LoRA trainable ratio too high: {lora_pct:.1f}%')
+                  lora_alerts.append(f"LoRA trainable ratio too high: {lora_pct:.1f}%")
           else:
-              print(f'NOTE: {summary_path} not found — LoRA health checks skipped')
+              print(f"NOTE: {summary_path} not found — LoRA health checks skipped")
 
-          # ------------------------------------------------------------------ #
-          # 4. Build the structured report                                       #
-          # ------------------------------------------------------------------ #
-          from datetime import datetime, timezone
-          week_start = datetime.fromtimestamp(week_ago, tz=timezone.utc).strftime('%Y-%m-%d')
-          week_end   = datetime.fromtimestamp(now_ts,   tz=timezone.utc).strftime('%Y-%m-%d')
-
-          hard_alerts = [a for a in all_alerts if a.severity == 'hard']
-          soft_alerts = [a for a in all_alerts if a.severity == 'soft']
+          week_start = datetime.fromtimestamp(week_ago, tz=timezone.utc).strftime("%Y-%m-%d")
+          week_end = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+          hard_alerts = [a for a in all_alerts if a.severity == "hard"]
+          soft_alerts = [a for a in all_alerts if a.severity == "soft"]
 
           lines = [
-              '=== WEEKLY REGRESSION REPORT ===',
-              f'Period   : {week_start} — {week_end}  ({len(recent)} snapshots scanned)',
-              f'Run URL  : {run_url}',
-              '',
+              "=== WEEKLY REGRESSION REPORT ===",
+              f"Period: {week_start} — {week_end} ({len(recent)} snapshots scanned)",
+              f"Run URL: {run_url}",
+              "",
           ]
 
           det_summary = detector.summary()
           if det_summary:
-              lines.append('Benchmark trends (latest vs best this week):')
+              lines.append("Benchmark trends (latest vs best this week):")
               for bname, info in det_summary.items():
-                  trend = 'OK' if info['latest'] >= info['best'] * 0.98 else 'DEGRADED'
+                  trend = "OK" if info["latest"] >= info["best"] * 0.98 else "DEGRADED"
                   lines.append(
-                      f'  {bname:20s}: latest={info["latest"]:.3f}  '
-                      f'best={info["best"]:.3f}  steps={info["n_steps"]}  [{trend}]'
+                      f" {bname:20s}: latest={info['latest']:.3f} "
+                      f"best={info['best']:.3f} steps={info['n_steps']} [{trend}]"
                   )
-              lines.append('')
+              lines.append("")
 
           if hard_alerts:
-              lines.append(f'HARD REGRESSIONS ({len(hard_alerts)}):')
+              lines.append(f"HARD REGRESSIONS ({len(hard_alerts)}):")
               for a in hard_alerts:
-                  lines.append(f'  [HARD] {a.message}')
-              lines.append('')
+                  lines.append(f" [HARD] {a.message}")
+              lines.append("")
 
           if soft_alerts:
-              lines.append(f'Soft regressions ({len(soft_alerts)}):')
+              lines.append(f"Soft regressions ({len(soft_alerts)}):")
               for a in soft_alerts:
-                  lines.append(f'  [soft] {a.message}')
-              lines.append('')
+                  lines.append(f" [soft] {a.message}")
+              lines.append("")
 
           if lora_alerts:
-              lines.append(f'LoRA injection alerts ({len(lora_alerts)}):')
+              lines.append(f"LoRA injection alerts ({len(lora_alerts)}):")
               for la in lora_alerts:
-                  lines.append(f'  [LoRA] {la}')
-              lines.append('')
+                  lines.append(f" [LoRA] {la}")
+              lines.append("")
 
           if not hard_alerts and not lora_alerts:
-              lines.append('No hard regressions detected. All recursive loops healthy.')
+              lines.append("No hard regressions detected. All recursive loops healthy.")
 
-          report = '\n'.join(lines)
+          report = "\n".join(lines)
           print(report)
 
-          # ------------------------------------------------------------------ #
-          # 5. Write GitHub Actions step outputs                                 #
-          # ------------------------------------------------------------------ #
           has_hard = len(hard_alerts) > 0 or len(lora_alerts) > 0
-
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as gh_out:
-              gh_out.write(f'hard_regression={str(has_hard).lower()}\n')
-              # GitHub Actions requires newlines URL-encoded in multi-line outputs
-              report_escaped = report.replace('\n', '%0A')
-              gh_out.write(f'regression_report={report_escaped}\n')
-              gh_out.write(f'run_url={run_url}\n')
+          with open(os.environ["GITHUB_OUTPUT"], "a") as gh_out:
+              gh_out.write(f"hard_regression={str(has_hard).lower()}\n")
+              report_escaped = report.replace("\n", "%0A")
+              gh_out.write(f"regression_report={report_escaped}\n")
+              gh_out.write(f"run_url={run_url}\n")
 
           if has_hard:
               sys.exit(1)
