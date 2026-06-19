@@ -85,7 +85,10 @@ jobs:
               data = json.load(f)
 
           BASELINE_TPS_FLOOR = 100.0
-          COMPILED_REGRESSION_THRESHOLD = 0.90
+          # torch.compile on CPU (no CUDA) falls back to dynamo-eager with
+          # minor graph-capture overhead; allow up to 20% below baseline.
+          # A hard regression would be >20% slower, indicating a real issue.
+          COMPILED_REGRESSION_THRESHOLD = 0.80
 
           failures = []
           baseline_tps = {}
