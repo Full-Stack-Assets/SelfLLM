@@ -1,0 +1,259 @@
+name: Training Monitor
+
+# Monitors performance metrics produced by training and self-improvement runs.
+# Triggered manually (workflow_dispatch) or when training output artifacts
+# are pushed to the results/ directory.
+#
+# The workflow:
+#   1. Validates training_summary.json schema and loss trends
+#   2. Runs the regression detector against eval snapshots in results/
+#   3. Checks serving engine metrics from benchmark_raw.json
+#   4. Posts a structured summary as a workflow annotation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "results/*.json"
+      - "run_output/**"
+  workflow_dispatch:
+    inputs:
+      summary_path:
+        description: "Path to training_summary.json (relative to repo root)"
+        required: false
+        default: "results/training_summary.json"
+      benchmark_path:
+        description: "Path to benchmark_raw.json"
+        required: false
+        default: "results/benchmark_raw.json"
+
+concurrency:
+  group: training-monitor-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Validate training summary JSON and loss curves
+  # ---------------------------------------------------------------------------
+  validate-training:
+    name: Validate Training Metrics
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate training_summary.json
+        run: |
+          python -c "
+          import json, sys, os
+
+          SUMMARY = '${{ github.event.inputs.summary_path || 'results/training_summary.json' }}'
+
+          if not os.path.exists(SUMMARY):
+              print(f'WARNING: {SUMMARY} not found — skipping training validation')
+              sys.exit(0)
+
+          with open(SUMMARY) as f:
+              s = json.load(f)
+
+          errors = []
+
+          # Required top-level keys
+          for key in ('model_params', 'pretrain', 'lora', 'self_improvement'):
+              if key not in s:
+                  errors.append(f'Missing key: {key}')
+
+          if not errors:
+              # Pre-training loss should be monotonically decreasing
+              pretrain = s.get('pretrain', {})
+              loss_hist = pretrain.get('loss_history', [])
+              if len(loss_hist) >= 2:
+                  for i in range(1, len(loss_hist)):
+                      if loss_hist[i] >= loss_hist[i-1]:
+                          print(f'WARNING: Pre-training loss did not decrease at epoch {i+1}: '
+                                f'{loss_hist[i-1]:.4f} -> {loss_hist[i]:.4f}')
+
+              # Self-improvement: check at least some iterations ran
+              si = s.get('self_improvement', {})
+              iters = si.get('iterations_run', 0)
+              if iters == 0:
+                  errors.append('self_improvement.iterations_run = 0')
+
+              # Model size sanity check
+              params = s.get('model_params', 0)
+              if params < 100_000:
+                  errors.append(f'Suspiciously small model: {params} params')
+
+              # LoRA: trainable should be < 10% of total
+              lora = s.get('lora', {})
+              lora_pct = lora.get('lora_pct', 0.0)
+              if lora_pct > 10.0:
+                  errors.append(f'LoRA trainable% too high: {lora_pct:.1f}% (expected <10%)')
+
+          print('=== Training Summary Validation ===')
+          print(f'  Model params     : {s.get(\"model_params\", \"N/A\"):,}')
+          pt = s.get('pretrain', {})
+          print(f'  Pretrain epochs  : {pt.get(\"epochs\", \"N/A\")}')
+          lh = pt.get('loss_history', [])
+          if lh:
+              print(f'  Pretrain losses  : {\" → \".join(f\"{x:.4f}\" for x in lh)}')
+          si = s.get('self_improvement', {})
+          print(f'  SI iterations    : {si.get(\"iterations_run\", \"N/A\")}')
+          print(f'  SI duration      : {si.get(\"duration_s\", \"N/A\")}s')
+          print(f'  Loss improvement : {si.get(\"loss_improvement_pct\", \"N/A\")}%')
+
+          if errors:
+              print()
+              print('VALIDATION ERRORS:')
+              for e in errors:
+                  print(f'  - {e}')
+              sys.exit(1)
+          else:
+              print()
+              print('Validation PASSED')
+          "
+
+  # ---------------------------------------------------------------------------
+  # Check eval snapshot regressions across results/ directory
+  # ---------------------------------------------------------------------------
+  regression-check:
+    name: Regression Detection
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch==2.2.2+cpu --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy==1.26.4
+          pip install -e ".[dev]"
+
+      - name: Run regression detector over results/
+        run: |
+          python -c "
+          import json, os, sys, glob
+
+          # Find all eval_*.json snapshots in results/
+          snapshots = sorted(glob.glob('results/eval_*.json'))
+          if not snapshots:
+              print('No eval snapshots found in results/ — skipping regression check')
+              sys.exit(0)
+
+          print(f'Found {len(snapshots)} eval snapshot(s)')
+
+          from selfllm.eval.regression import RegressionDetector
+          from selfllm.eval.suite import SuiteResult
+          from selfllm.eval.harness import EvalResult
+
+          detector = RegressionDetector(hard_threshold=0.05, soft_threshold=0.02, patience=3)
+          all_alerts = []
+
+          for path in snapshots:
+              with open(path) as f:
+                  data = json.load(f)
+              results = [
+                  EvalResult(
+                      name=r['name'], score=r['score'], n=r['n'],
+                      details=r.get('details', {}),
+                  )
+                  for r in data.get('results', [])
+              ]
+              suite_result = SuiteResult(
+                  tag=data.get('tag', os.path.basename(path)),
+                  timestamp=data.get('timestamp', 0),
+                  results=results,
+                  elapsed_s=data.get('elapsed_s', 0),
+              )
+              alerts = detector.update(suite_result)
+              all_alerts.extend(alerts)
+
+          print()
+          print('=== Regression Summary ===')
+          summary = detector.summary()
+          for name, info in summary.items():
+              print(f'  {name}: latest={info[\"latest\"]:.3f}  best={info[\"best\"]:.3f}  steps={info[\"n_steps\"]}')
+
+          if all_alerts:
+              print()
+              print(f'REGRESSIONS DETECTED ({len(all_alerts)}):')
+              for a in all_alerts:
+                  print(f'  [{a.severity.upper()}] {a.message}')
+              hard = [a for a in all_alerts if a.severity == 'hard']
+              if hard:
+                  sys.exit(1)   # Hard regressions fail the workflow
+              else:
+                  print('(Only soft regressions — workflow passes with warning)')
+          else:
+              print('No regressions detected.')
+          "
+
+  # ---------------------------------------------------------------------------
+  # Serving engine metrics check
+  # ---------------------------------------------------------------------------
+  serving-metrics:
+    name: Serving Metrics Monitor
+    runs-on: ubuntu-latest
+    if: contains(github.event.head_commit.message, 'training') || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check benchmark_raw.json (if present)
+        run: |
+          python -c "
+          import json, os, sys
+
+          BENCH = '${{ github.event.inputs.benchmark_path || 'results/benchmark_raw.json' }}'
+
+          if not os.path.exists(BENCH):
+              print(f'benchmark_raw.json not found at {BENCH} — skipping serving metrics check')
+              sys.exit(0)
+
+          with open(BENCH) as f:
+              rows = json.load(f)
+
+          print('=== Serving Engine Metrics ===')
+          baseline_tps = {}
+          for row in rows:
+              eng = row.get('engine','')
+              wl  = row.get('workload','')
+              tps = row.get('tokens_per_sec', 0)
+              avg = row.get('avg_latency_s', 0) * 1000
+              p95 = row.get('p95_latency_s', 0) * 1000
+              print(f'  {eng:25s} | {wl:20s} | {tps:7.1f} tok/s | avg={avg:.0f}ms p95={p95:.0f}ms')
+              if eng == 'A_baseline_eager':
+                  baseline_tps[wl] = tps
+
+          # Check no workload has zero throughput (indicates a hang/crash)
+          zero_tps = [r for r in rows if r.get('tokens_per_sec', 0) < 1.0]
+          if zero_tps:
+              print()
+              print('ERROR: Zero-throughput results detected:')
+              for r in zero_tps:
+                  print(f'  {r[\"engine\"]} / {r[\"workload\"]}')
+              sys.exit(1)
+          else:
+              print()
+              print('All serving metrics look healthy.')
+          "

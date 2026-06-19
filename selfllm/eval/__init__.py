@@ -113,3 +113,13 @@ __all__ = [
     "load_humaneval",
     "pass_at_k",
 ]
+
+from .suite import BenchmarkSuite, SuiteResult
+from .regression import RegressionAlert, RegressionDetector
+
+__all__ += [
+    "BenchmarkSuite",
+    "SuiteResult",
+    "RegressionAlert",
+    "RegressionDetector",
+]
