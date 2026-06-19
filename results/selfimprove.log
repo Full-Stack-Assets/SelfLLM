@@ -1,0 +1,227 @@
+18:51:31  ────────────────────────────────────────────────────────────────────
+18:51:31    Step 1 — Load Tokenizer
+18:51:31  ────────────────────────────────────────────────────────────────────
+18:51:31    Tokenizer  vocab=8000  merges=7912
+18:51:31  ────────────────────────────────────────────────────────────────────
+18:51:31    Step 2 — Load Pre-Trained Model
+18:51:31  ────────────────────────────────────────────────────────────────────
+18:51:31    Loaded weights from ./run_output/pretrained/pytorch_model.bin
+18:51:31    Model  6.8M params (6.8M)  device=cpu
+18:51:31  
+  ── Generation after pre-training (loaded) ──
+18:51:31      'The science of'               → 'ofofofofofofofofofofofofIIofofof'
+18:51:31      'Once upon a time'             → 'hadhadhadininandandandandandandandandininandandandandandandandandandand'
+18:51:32      'It was a dark and stormy night' → 'asanotIII“““ininorall’thethethethe”andandandandandand'
+18:51:32      'In the beginning'             → 'iseyour,,,,,,,,,,,,,,,,,,,,,,,'
+18:51:32  ────────────────────────────────────────────────────────────────────
+18:51:32    Step 3 — Inject LoRA  (rank=8)
+18:51:32  ────────────────────────────────────────────────────────────────────
+18:51:32    Trainable : 94.2K  (1.37%)
+18:51:32    Frozen    : 6.8M
+18:51:32  ────────────────────────────────────────────────────────────────────
+18:51:32    Step 4 — Recursive Self-Improvement  (10 iters, DPO=True)
+18:51:32  ────────────────────────────────────────────────────────────────────
+18:51:32    ✓ Patched data_generator: max_new_tokens=32
+18:51:32  
+  ── Iteration 1/10 ──
+18:53:31    ✓ Iter  1  loss=inf  ppl=3371.23  quality=0.4525  Δ=-1.0000  (119.8s)
+18:53:31  
+  ── Iteration 2/10 ──
+18:55:29    ✓ Iter  2  loss=inf  ppl=3371.23  quality=0.4524  Δ=-1.0000  (117.6s)
+18:55:29  
+  ── Iteration 3/10 ──
+18:57:26    ✓ Iter  3  loss=inf  ppl=3371.23  quality=0.4646  Δ=-1.0000  (117.5s)
+18:57:26  
+  ── Iteration 4/10 ──
+18:59:26    ✓ Iter  4  loss=inf  ppl=3371.23  quality=0.4525  Δ=-1.0000  (119.1s)
+18:59:26  
+  ── Iteration 5/10 ──
+19:01:23    ✓ Iter  5  loss=inf  ppl=3371.23  quality=0.4525  Δ=-1.0000  (117.9s)
+19:01:23  
+  ── Iteration 6/10 ──
+19:08:18    ✓ Iter  6  loss=inf  ppl=3371.23  quality=0.4525  Δ=-1.0000  (414.6s)
+19:08:18  
+  ── Iteration 7/10 ──
+19:08:18    ✗ Iter 7 FAILED after 0.0s: [Errno 32] Broken pipe
+19:10:10  ────────────────────────────────────────────────────────────────────
+19:10:10    Step 1 — Load Tokenizer
+19:10:10  ────────────────────────────────────────────────────────────────────
+19:10:10    Tokenizer  vocab=8000  merges=7912
+19:10:10  ────────────────────────────────────────────────────────────────────
+19:10:10    Step 2 — Load Pre-Trained Model
+19:10:10  ────────────────────────────────────────────────────────────────────
+19:10:10    Loaded weights from ./run_output/pretrained/pytorch_model.bin
+19:10:10    Model  6.8M params (6.8M)  device=cpu
+19:10:10  
+  ── Generation after pre-training (loaded) ──
+19:10:10      'The science of'               → 'ofofofofofofofofofofofofIIofofof'
+19:10:10      'Once upon a time'             → 'hadhadhadininandandandandandandandandininandandandandandandandandandand'
+19:10:11      'It was a dark and stormy night' → 'asanotIII“““ininorall’thethethethe”andandandandandand'
+19:10:11      'In the beginning'             → 'iseyour,,,,,,,,,,,,,,,,,,,,,,,'
+19:10:11  ────────────────────────────────────────────────────────────────────
+19:10:11    Step 3 — Inject LoRA  (rank=8)
+19:10:11  ────────────────────────────────────────────────────────────────────
+19:10:11    Trainable : 94.2K  (1.37%)
+19:10:11    Frozen    : 6.8M
+19:10:11  ────────────────────────────────────────────────────────────────────
+19:10:11    Step 4 — Recursive Self-Improvement  (10 iters, LoRA CE fine-tuning)
+19:10:11  ────────────────────────────────────────────────────────────────────
+19:10:11    ✓ Patched data_generator: max_new_tokens=32
+19:10:11    ✓ Patched evaluator: fast eval mode (4 prompts, 16 tokens)
+19:10:11  
+  ── Iteration 1/10 ──
+19:10:13    ✓ Iter  1  loss=inf  ppl=3371.23  quality=0.2275  Δ=-1.0000  (2.2s)
+19:10:13  
+  ── Iteration 2/10 ──
+19:10:15    ✓ Iter  2  loss=inf  ppl=3371.23  quality=0.2275  Δ=-1.0000  (2.3s)
+19:10:15  
+  ── Iteration 3/10 ──
+19:10:18    ✓ Iter  3  loss=inf  ppl=3371.23  quality=0.2275  Δ=-1.0000  (2.4s)
+19:10:18  
+  ── Iteration 4/10 ──
+19:10:20    ✓ Iter  4  loss=inf  ppl=3371.23  quality=0.2275  Δ=-1.0000  (2.3s)
+19:10:20  
+  ── Iteration 5/10 ──
+19:10:22    ✓ Iter  5  loss=inf  ppl=3371.23  quality=0.2275  Δ=-1.0000  (2.2s)
+19:10:22  
+  ── Iteration 6/10 ──
+19:10:24    ✓ Iter  6  loss=inf  ppl=3371.23  quality=0.2275  Δ=-1.0000  (2.2s)
+19:10:24  
+  ── Iteration 7/10 ──
+19:10:27    ✓ Iter  7  loss=inf  ppl=3371.23  quality=0.2275  Δ=-1.0000  (2.2s)
+19:10:27  
+  ── Iteration 8/10 ──
+19:10:29    ✓ Iter  8  loss=inf  ppl=3371.23  quality=0.2275  Δ=-1.0000  (2.3s)
+19:10:29  
+  ── Iteration 9/10 ──
+19:10:31    ✓ Iter  9  loss=inf  ppl=3371.23  quality=0.2275  Δ=-1.0000  (2.2s)
+19:10:31  
+  ── Iteration 10/10 ──
+19:10:33    ✓ Iter 10  loss=inf  ppl=3371.23  quality=0.2275  Δ=-1.0000  (2.2s)
+19:10:33  
+  Self-improvement complete  22.4s  (0.4min)
+19:10:33  
+  Iter    Gen  Kept      Loss       PPL  Quality         Δ    Time
+19:10:33    ──────────────────────────────────────────────────────────────────
+19:10:33       1      8     0       inf   3371.23   0.2275   -1.0000    2.2s
+19:10:33       2      8     0       inf   3371.23   0.2275   -1.0000    2.3s
+19:10:33       3      8     0       inf   3371.23   0.2275   -1.0000    2.4s
+19:10:33       4      8     0       inf   3371.23   0.2275   -1.0000    2.3s
+19:10:33       5      8     0       inf   3371.23   0.2275   -1.0000    2.2s
+19:10:33       6      8     0       inf   3371.23   0.2275   -1.0000    2.2s
+19:10:33       7      8     0       inf   3371.23   0.2275   -1.0000    2.2s
+19:10:33       8      8     0       inf   3371.23   0.2275   -1.0000    2.3s
+19:10:33       9      8     0       inf   3371.23   0.2275   -1.0000    2.2s
+19:10:33      10      8     0       inf   3371.23   0.2275   -1.0000    2.2s
+19:10:33  
+  ── Generation after 10 self-improvement iterations ──
+19:10:33      'The science of'               → 'ofofofofofofofofofofIaaathatsofofofofofofofsthat'
+19:10:34      'Once upon a time'             → 'andandandandandandandandandandandandin””andandandandandandandin'
+19:10:34      'It was a dark and stormy night' → 'thatIIthethethethethethethethethethethethethethethethethethethethethethe'
+19:10:34      'In the beginning'             → 'repeatedcompinstantlihasnot'
+19:10:34  ────────────────────────────────────────────────────────────────────
+19:10:34    Step 5 — Save Final Artefacts
+19:10:34  ────────────────────────────────────────────────────────────────────
+19:10:34    Final model  → ./run_output/final_model
+19:10:34    Tokenizer    → ./run_output/tokenizer.json
+19:10:34    Summary      → ./run_output/training_summary.json
+19:10:34  ────────────────────────────────────────────────────────────────────
+19:10:34    Self-Improvement Complete!
+19:10:34  ────────────────────────────────────────────────────────────────────
+19:10:34    Model         : 6.8M params (6.8M)
+19:10:34    LoRA          : 94.2K trainable (1.37%)
+19:10:34    Iterations    : 10/10
+19:10:34    Total time    : 24.3s  (0.4min)
+19:10:34    Outputs       : ./run_output/
+19:11:10  ────────────────────────────────────────────────────────────────────
+19:11:10    Step 1 — Load Tokenizer
+19:11:10  ────────────────────────────────────────────────────────────────────
+19:11:10    Tokenizer  vocab=8000  merges=7912
+19:11:10  ────────────────────────────────────────────────────────────────────
+19:11:10    Step 2 — Load Pre-Trained Model
+19:11:10  ────────────────────────────────────────────────────────────────────
+19:11:10    Loaded weights from ./run_output/pretrained/pytorch_model.bin
+19:11:10    Model  6.8M params (6.8M)  device=cpu
+19:11:10  
+  ── Generation after pre-training (loaded) ──
+19:11:11      'The science of'               → 'ofofofofofofofofofofofofIIofofof'
+19:11:11      'Once upon a time'             → 'hadhadhadininandandandandandandandandininandandandandandandandandandand'
+19:11:11      'It was a dark and stormy night' → 'asanotIII“““ininorall’thethethethe”andandandandandand'
+19:11:11      'In the beginning'             → 'iseyour,,,,,,,,,,,,,,,,,,,,,,,'
+19:11:11  ────────────────────────────────────────────────────────────────────
+19:11:11    Step 3 — Inject LoRA  (rank=8)
+19:11:11  ────────────────────────────────────────────────────────────────────
+19:11:11    Trainable : 94.2K  (1.37%)
+19:11:11    Frozen    : 6.8M
+19:11:11  ────────────────────────────────────────────────────────────────────
+19:11:11    Step 4 — Recursive Self-Improvement  (10 iters, LoRA CE fine-tuning)
+19:11:11  ────────────────────────────────────────────────────────────────────
+19:11:11    ✓ Patched data_generator: max_new_tokens=32
+19:11:11    ✓ Patched evaluator: fast eval mode (4 prompts, 16 tokens)
+19:11:11    ✓ Patched quality_filter: pass-through mode (keep all samples)
+19:11:11  
+  ── Iteration 1/10 ──
+19:11:16    ✓ Iter  1  loss=1.4501  ppl=2976.25  quality=0.2275  Δ=+0.0000  (5.0s)
+19:11:16  
+  ── Iteration 2/10 ──
+19:11:21    ✓ Iter  2  loss=4.1695  ppl=2857.99  quality=0.2275  Δ=+0.0159  (4.3s)
+19:11:21  
+  ── Iteration 3/10 ──
+19:11:25    ✓ Iter  3  loss=1.8457  ppl=2909.48  quality=0.2275  Δ=-0.0072  (4.3s)
+19:11:25  
+  ── Iteration 4/10 ──
+19:11:29    ✓ Iter  4  loss=2.1201  ppl=2925.75  quality=0.2275  Δ=-0.0095  (4.3s)
+19:11:29  
+  ── Iteration 5/10 ──
+19:11:34    ✓ Iter  5  loss=1.9306  ppl=2878.34  quality=0.2275  Δ=-0.0028  (4.3s)
+19:11:34  
+  ── Iteration 6/10 ──
+19:11:38    ✓ Iter  6  loss=2.6859  ppl=2920.47  quality=0.2275  Δ=-0.0087  (4.3s)
+19:11:38  
+  ── Iteration 7/10 ──
+19:11:42    ✓ Iter  7  loss=1.8659  ppl=2834.66  quality=0.2275  Δ=+0.0033  (4.3s)
+19:11:42  
+  ── Iteration 8/10 ──
+19:11:47    ✓ Iter  8  loss=2.5845  ppl=2978.80  quality=0.2275  Δ=-0.0203  (4.5s)
+19:11:47  
+  ── Iteration 9/10 ──
+19:11:51    ✓ Iter  9  loss=3.7147  ppl=2858.44  quality=0.2275  Δ=-0.0034  (4.3s)
+19:11:51  
+  ── Iteration 10/10 ──
+19:11:55    ✓ Iter 10  loss=2.1733  ppl=2874.16  quality=0.2275  Δ=-0.0056  (4.3s)
+19:11:55  
+  Self-improvement complete  43.9s  (0.7min)
+19:11:55  
+  Iter    Gen  Kept      Loss       PPL  Quality         Δ    Time
+19:11:55    ──────────────────────────────────────────────────────────────────
+19:11:55       1      8     8    1.4501   2976.25   0.2275   +0.0000    5.0s
+19:11:55       2      8     8    4.1695   2857.99   0.2275   +0.0159    4.3s
+19:11:55       3      8     8    1.8457   2909.48   0.2275   -0.0072    4.3s
+19:11:55       4      8     8    2.1201   2925.75   0.2275   -0.0095    4.3s
+19:11:55       5      8     8    1.9306   2878.34   0.2275   -0.0028    4.3s
+19:11:55       6      8     8    2.6859   2920.47   0.2275   -0.0087    4.2s
+19:11:55       7      8     8    1.8659   2834.66   0.2275   +0.0033    4.3s
+19:11:55       8      8     8    2.5845   2978.80   0.2275   -0.0203    4.5s
+19:11:55       9      8     8    3.7147   2858.44   0.2275   -0.0034    4.3s
+19:11:55      10      8     8    2.1733   2874.16   0.2275   -0.0056    4.3s
+19:11:55  
+  ── Generation after 10 self-improvement iterations ──
+19:11:55      'The science of'               → 'ofofsI'
+19:11:56      'Once upon a time'             → '““aIIIhaveofofofofofofofofthethethethethethethethethethe'
+19:11:56      'It was a dark and stormy night' → 'caheitita’andandininthey'
+19:11:56      'In the beginning'             → 'wilddonespeakII'
+19:11:56  ────────────────────────────────────────────────────────────────────
+19:11:56    Step 5 — Save Final Artefacts
+19:11:56  ────────────────────────────────────────────────────────────────────
+19:11:57    Final model  → ./run_output/final_model
+19:11:57    Tokenizer    → ./run_output/tokenizer.json
+19:11:57    Summary      → ./run_output/training_summary.json
+19:11:57  ────────────────────────────────────────────────────────────────────
+19:11:57    Self-Improvement Complete!
+19:11:57  ────────────────────────────────────────────────────────────────────
+19:11:57    Model         : 6.8M params (6.8M)
+19:11:57    LoRA          : 94.2K trainable (1.37%)
+19:11:57    SI loss       : 1.4501 → 2.1733  (+49.9%)
+19:11:57    Iterations    : 10/10
+19:11:57    Total time    : 46.3s  (0.8min)
+19:11:57    Outputs       : ./run_output/
