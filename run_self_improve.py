@@ -34,6 +34,7 @@ from selfllm.model.model import SelfImprovingLLM
 from selfllm.model.tokenizer import BPETokenizer
 from selfllm.recursive.recursive_config import RecursiveConfig
 from selfllm.recursive.recursive_trainer import RecursiveSelfTrainer
+from selfllm.serving.optimized import compile_model, is_compiled
 from selfllm.utils import count_parameters, format_num, set_seed
 
 # ---------------------------------------------------------------------------
@@ -283,6 +284,18 @@ def main() -> None:
     logger.info(f"  Trainable : {format_num(lora_info['lora'])}  ({lora_info['lora_pct']:.2f}%)")
     logger.info(f"  Frozen    : {format_num(lora_info['frozen'])}")
     log_event({"phase": "lora_injected", **lora_info})
+
+    # ------------------------------------------------------------------ #
+    # Step 3b — Wrap with compile_model() for future-proof acceleration
+    # ------------------------------------------------------------------ #
+    # Zero-risk: degrades gracefully to eager on Python 3.12 + torch 2.2.
+    # Will auto-activate on Python ≤3.11 or any CUDA environment.
+    # Must come AFTER inject_lora() so LoRA params are part of the compiled graph.
+    model = compile_model(model, mode="reduce-overhead")
+    active = is_compiled(model)
+    logger.info(f"  compile_model()  active={active}  "
+                f"({'torch.compile ACTIVE' if active else 'eager fallback — upgrade to Python 3.11 for real speedup'})")
+    log_event({"phase": "compile_model", "compile_active": active})
 
     # ------------------------------------------------------------------ #
     # Step 4 — Recursive Self-Improvement

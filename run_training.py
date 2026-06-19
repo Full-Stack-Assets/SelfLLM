@@ -34,6 +34,7 @@ from selfllm.model.model import SelfImprovingLLM
 from selfllm.model.tokenizer import BPETokenizer
 from selfllm.recursive.recursive_config import RecursiveConfig
 from selfllm.recursive.recursive_trainer import RecursiveSelfTrainer
+from selfllm.serving.optimized import compile_model, is_compiled
 from selfllm.training.dataset import SelfTrainingDataset
 from selfllm.training.trainer import LLMTrainer
 from selfllm.utils import count_parameters, format_num, set_seed
@@ -249,6 +250,19 @@ def main() -> None:
     logger.info(f"  Trainable : {format_num(lora_info['lora'])}  ({lora_info['lora_pct']:.2f}%)")
     logger.info(f"  Frozen    : {format_num(lora_info['frozen'])}")
     log_event({"phase": "lora_injected", **lora_info})
+
+    # ------------------------------------------------------------------ #
+    # Step 4b — Wrap with compile_model() for future-proof acceleration
+    # ------------------------------------------------------------------ #
+    # compile_model() falls back to eager on Python 3.12 / torch 2.2 (torch.dynamo
+    # unsupported), so this is zero-risk.  On Python ≤3.11 or a GPU environment
+    # it activates torch.compile(mode="reduce-overhead") for 2–6× speedup.
+    # LoRA injection must complete BEFORE compilation so LoRA params are included.
+    model = compile_model(model, mode="reduce-overhead")
+    active = is_compiled(model)
+    logger.info(f"  compile_model()  active={active}  "
+                f"({'torch.compile ACTIVE' if active else 'eager fallback — Python 3.12 / torch.dynamo unsupported'})")
+    log_event({"phase": "compile_model", "compile_active": active})
 
     # ------------------------------------------------------------------ #
     # Step 5 — Recursive Self-Improvement
