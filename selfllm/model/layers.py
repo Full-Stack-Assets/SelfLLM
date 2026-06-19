@@ -133,6 +133,7 @@ class TransformerBlock(nn.Module):
         use_cache: bool = False,
         positions: Optional[torch.Tensor] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
+        streaming: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Any]]:
         """Forward pass through the transformer block.
 
@@ -143,6 +144,7 @@ class TransformerBlock(nn.Module):
             use_cache: If ``True``, also return the updated KV cache.
             positions: Optional per-row absolute positions for batched decode.
             key_padding_mask: Optional cached-key validity mask for batched decode.
+            streaming: If ``True``, use attention-time (cache-relative) RoPE.
 
         Returns:
             Output tensor ``[batch, seq_len, d_model]``, or a
@@ -156,6 +158,7 @@ class TransformerBlock(nn.Module):
             use_cache=use_cache,
             positions=positions,
             key_padding_mask=key_padding_mask,
+            streaming=streaming,
         )
         x = x + attn_out
 

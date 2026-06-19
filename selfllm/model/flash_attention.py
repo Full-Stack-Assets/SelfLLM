@@ -348,6 +348,7 @@ class HybridAttention(nn.Module):
         use_cache: bool = False,
         positions: Optional[torch.Tensor] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
+        streaming: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Any]]:
         """Forward pass -- delegates to the selected backend.
 
@@ -360,7 +361,7 @@ class HybridAttention(nn.Module):
         decoding and are only honoured by the standard backend (the batched
         serving path runs on that backend).
         """
-        if self.backend == "flash_attn" and key_padding_mask is None and positions is None:
+        if self.backend == "flash_attn" and key_padding_mask is None and positions is None and not streaming:
             # FlashAttention2 only populates a cache when one is passed in, so
             # seed an empty cache on prefill to capture the prompt's K/V.
             if use_cache and kv_cache is None:
@@ -391,6 +392,7 @@ class HybridAttention(nn.Module):
                 kv_cache=kv_cache,
                 positions=positions,
                 key_padding_mask=key_padding_mask,
+                streaming=streaming,
             )
         return out, (new_cache if use_cache else None)
 

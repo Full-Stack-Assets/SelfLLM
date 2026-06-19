@@ -153,6 +153,7 @@ class RoPEMultiHeadAttention(nn.Module):
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         positions: Optional[torch.Tensor] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
+        streaming: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """Forward pass for multi-head attention with RoPE.
 
@@ -185,23 +186,37 @@ class RoPEMultiHeadAttention(nn.Module):
         k = k.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Apply RoPE to Q and K. During incremental decoding the new tokens
-        # sit at absolute positions starting just after the cached ones; for
-        # batched decode each row has its own position.
-        cache_len = kv_cache[0].shape[2] if kv_cache is not None else 0
-        q = self._apply_rope(q, seq_len, start_pos=cache_len, positions=positions)
-        k = self._apply_rope(k, seq_len, start_pos=cache_len, positions=positions)
-
-        # Merge with KV cache if provided (autoregressive generation).
-        # The cached K/V were already rotated when they were produced, so only
-        # the new tokens are rotated above before concatenation.
-        if kv_cache is not None:
-            cached_k, cached_v = kv_cache
-            k = torch.cat([cached_k, k], dim=2)
-            v = torch.cat([cached_v, v], dim=2)
-        new_cache = (k, v)
-
-        kv_len = k.shape[2]
+        # Apply RoPE to Q and K.
+        if streaming:
+            # Streaming / attention-time RoPE: the cache stores UN-rotated keys
+            # and rotation happens here using cache-relative positions. Combined
+            # with sliding-window eviction the cache is bounded, so positions
+            # stay in [0, kv_len) ⊂ [0, max_seq_len) and never saturate --
+            # enabling correct generation unbounded by the context window.
+            if kv_cache is not None:
+                cached_k, cached_v = kv_cache  # un-rotated
+                k = torch.cat([cached_k, k], dim=2)
+                v = torch.cat([cached_v, v], dim=2)
+            new_cache = (k, v)  # store the un-rotated keys
+            kv_len = k.shape[2]
+            kpos = torch.arange(kv_len, device=x.device).unsqueeze(0).expand(batch, -1)
+            k = self._apply_rope(k, kv_len, positions=kpos)
+            q = self._apply_rope(q, seq_len, positions=kpos[:, kv_len - seq_len:])
+        else:
+            # Baked-RoPE path (default). During incremental decoding the new
+            # tokens sit at absolute positions just after the cached ones; for
+            # batched decode each row has its own position. The cached K/V were
+            # already rotated when produced, so only the new tokens are rotated
+            # here before concatenation.
+            cache_len = kv_cache[0].shape[2] if kv_cache is not None else 0
+            q = self._apply_rope(q, seq_len, start_pos=cache_len, positions=positions)
+            k = self._apply_rope(k, seq_len, start_pos=cache_len, positions=positions)
+            if kv_cache is not None:
+                cached_k, cached_v = kv_cache
+                k = torch.cat([cached_k, k], dim=2)
+                v = torch.cat([cached_v, v], dim=2)
+            new_cache = (k, v)
+            kv_len = k.shape[2]
 
         # Causal mask: auto-create if not provided
         if mask is None:

@@ -138,6 +138,7 @@ class SelfImprovingLLM(nn.Module):
         use_cache: bool = False,
         positions: Optional[torch.Tensor] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
+        streaming: bool = False,
     ) -> Dict[str, Any]:
         """Forward pass through the model.
 
@@ -177,16 +178,18 @@ class SelfImprovingLLM(nn.Module):
         window = getattr(self.config, "sliding_window", None)
         sinks = getattr(self.config, "attention_sinks", 0)
         if past_key_values is not None:
-            if window and positions is None and key_padding_mask is None:
+            if window and not streaming and positions is None and key_padding_mask is None:
                 cache_len = past_key_values[0][0].shape[2]
                 mask = _create_sliding_window_decode_mask(
                     seq_len, cache_len, device, window, sinks
                 )
             else:
                 # Cached decode: attention builds the correct causal mask from
-                # the cache length (or batched serving supplies positions/mask).
+                # the cache length. In streaming mode the cache is already
+                # bounded (evicted), so plain causal over it is exactly the
+                # sliding window -- no windowed mask needed.
                 mask = None
-        elif window:
+        elif window and not streaming:
             mask = _create_sliding_window_mask(seq_len, device, window, sinks)
         else:
             mask = _create_causal_mask(seq_len, device)
@@ -205,6 +208,7 @@ class SelfImprovingLLM(nn.Module):
                     use_cache=True,
                     positions=positions,
                     key_padding_mask=key_padding_mask,
+                    streaming=streaming,
                 )
                 new_caches.append(layer_cache)
             elif self.config.grad_checkpoint and self.training:
@@ -337,15 +341,16 @@ class SelfImprovingLLM(nn.Module):
         # own stop token rather than waiting for every row to emit one.
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-        # Sliding-window KV-cache eviction: for a windowed model, keep only the
-        # first `attention_sinks` keys plus the most recent `sliding_window`,
-        # bounding decode memory to O(window) instead of O(n). The new token is
-        # given its true absolute position so the kept recent window stays
-        # positionally correct.
+        # Sliding-window streaming: for a windowed model, use attention-time
+        # (cache-relative) RoPE and evict the KV cache after each step to keep
+        # only the first `attention_sinks` keys plus the most recent
+        # `sliding_window`. This bounds decode memory to O(window) AND keeps
+        # positions in [0, window) so they never saturate -- generation is
+        # correct and unbounded by the context window. Non-windowed models are
+        # unaffected.
         window = getattr(self.config, "sliding_window", None)
         sinks = getattr(self.config, "attention_sinks", 0)
         use_evict = bool(window)
-        abs_pos = 0  # absolute position of the next token fed to the model
 
         for step in range(max_new_tokens):
             # Prepare inputs
@@ -359,24 +364,14 @@ class SelfImprovingLLM(nn.Module):
                 # Decode: feed only the most recently sampled token.
                 input_ids = next_token
 
-            # Forward pass (with incremental KV cache). When evicting, pass the
-            # new token's true absolute position so its RoPE matches the kept
-            # recent-window keys (which retain their original rotations).
-            if use_evict and past_key_values is not None:
-                positions = torch.full(
-                    (batch_size, input_ids.shape[1]), abs_pos,
-                    device=device, dtype=torch.long,
-                )
-                out = self.forward(
-                    input_ids, past_key_values=past_key_values,
-                    use_cache=True, positions=positions,
-                )
-            else:
-                out = self.forward(
-                    input_ids, past_key_values=past_key_values, use_cache=True
-                )
+            # Forward pass (incremental KV cache). In streaming mode the cache
+            # stores un-rotated keys and RoPE is applied at attention time with
+            # cache-relative positions.
+            out = self.forward(
+                input_ids, past_key_values=past_key_values,
+                use_cache=True, streaming=use_evict,
+            )
             past_key_values = out["past_key_values"]
-            abs_pos += input_ids.shape[1]
             if use_evict:
                 past_key_values = self._evict_kv_cache(past_key_values, sinks, window)
             logits = out["logits"][:, -1, :]  # [batch, vocab_size] — last position
