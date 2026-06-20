@@ -575,7 +575,7 @@ class TestMixedPrecision:
             model=tiny_model,
             tokenizer=tokenizer,
         )
-        if torch.cuda.is_bf16_supported() and torch.cuda.is_available():
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
             assert trainer._amp_dtype == torch.bfloat16
             # bf16 does not need gradient scaling
             assert trainer.scaler is None
