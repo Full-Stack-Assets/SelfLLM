@@ -858,3 +858,119 @@ class TestEndToEnd:
         assert scheduler.completed_requests[0].id == req1.id
         assert scheduler.completed_requests[1].id == req2.id
         assert scheduler.completed_requests[2].id == req3.id
+
+
+# ---------------------------------------------------------------------------
+# Streaming-window (StreamingLLM) KV eviction in the scheduler
+# ---------------------------------------------------------------------------
+
+
+class TestStreamingWindowEviction:
+    """A sliding-window model keeps each request's decode cache bounded so the
+    server can hold unbounded / long-running conversations."""
+
+    def _build(self, sliding_window, sinks, max_seq_len=16, max_batch_size=4):
+        """Build a real tiny windowed model + scheduler on CPU."""
+        from selfllm.model.config import ModelConfig
+        from selfllm.model.model import SelfImprovingLLM
+
+        cfg = ModelConfig(
+            vocab_size=64,
+            d_model=32,
+            n_layers=2,
+            n_heads=2,
+            d_ff=64,
+            max_seq_len=max_seq_len,
+            dropout=0.0,
+            sliding_window=sliding_window,
+            attention_sinks=sinks,
+        )
+        model = SelfImprovingLLM(cfg).eval()
+        tok = MagicMock()
+        tok.eos_token_id = -1  # never emitted -> request runs to its length cap
+        bm = BlockManager(
+            num_blocks=64, block_size=4, num_layers=cfg.n_layers,
+            num_heads=cfg.n_heads, head_dim=cfg.d_model // cfg.n_heads,
+            dtype=torch.float32, device="cpu",
+        )
+        sched = ContinuousBatchingScheduler(
+            model, tok, bm, max_batch_size=max_batch_size, device="cpu"
+        )
+        return sched, cfg
+
+    def test_cache_stays_bounded_while_position_grows(self):
+        """cache_len never exceeds sinks+window even as abs_pos grows past it
+        and past the model's max_seq_len (RoPE saturation)."""
+        sched, cfg = self._build(sliding_window=8, sinks=2, max_seq_len=16)
+        budget = cfg.sliding_window + cfg.attention_sinks  # 10
+
+        req = sched.create_request(
+            prompt_tokens=[3, 4, 5], max_new_tokens=40, temperature=0.0
+        )
+        max_abs_pos = 0
+        steps = 0
+        while not req.is_finished and steps < 200:
+            sched.step()
+            steps += 1
+            state = sched._req_cache.get(req.id)
+            if state is not None:
+                # Physical cache memory is bounded by the window budget.
+                assert state["cache_len"] <= budget
+                max_abs_pos = max(max_abs_pos, state["abs_pos"])
+
+        assert req.is_finished
+        assert len(req.generated_tokens) == 40
+        # Absolute position climbed well past both the window budget and the
+        # model's max_seq_len -- proving position is decoupled from cache size.
+        assert max_abs_pos > budget
+        assert max_abs_pos > cfg.max_seq_len
+
+    def test_no_eviction_when_window_unset(self):
+        """Without a sliding window the cache grows with the sequence and the
+        scheduler behaves exactly as before (abs_pos == cache_len)."""
+        sched, _ = self._build(sliding_window=None, sinks=0, max_seq_len=64)
+        assert sched._use_evict is False
+
+        req = sched.create_request(
+            prompt_tokens=[3, 4, 5], max_new_tokens=10, temperature=0.0
+        )
+        seen = []
+        while not req.is_finished:
+            sched.step()
+            state = sched._req_cache.get(req.id)
+            if state is not None:
+                # No eviction: physical length equals the absolute position.
+                assert state["cache_len"] == state["abs_pos"]
+                seen.append(state["cache_len"])
+        assert req.is_finished
+        assert seen == sorted(seen)  # monotonically non-decreasing
+        assert seen[-1] > 3  # grew past the prompt length
+
+    def test_concurrent_windowed_requests(self):
+        """Several windowed requests of differing lengths decode together and
+        all stay bounded -- exercises the batched, right-padded decode path."""
+        sched, cfg = self._build(sliding_window=6, sinks=1, max_seq_len=16)
+        budget = cfg.sliding_window + cfg.attention_sinks
+
+        reqs = [
+            sched.create_request(
+                prompt_tokens=[2, 3], max_new_tokens=25, temperature=0.0
+            ),
+            sched.create_request(
+                prompt_tokens=[4, 5, 6, 7], max_new_tokens=30, temperature=0.0
+            ),
+            sched.create_request(
+                prompt_tokens=[8], max_new_tokens=20, temperature=0.0
+            ),
+        ]
+        steps = 0
+        while not all(r.is_finished for r in reqs) and steps < 300:
+            sched.step()
+            steps += 1
+            for r in reqs:
+                state = sched._req_cache.get(r.id)
+                if state is not None:
+                    assert state["cache_len"] <= budget
+
+        assert all(r.is_finished for r in reqs)
+        assert [len(r.generated_tokens) for r in reqs] == [25, 30, 20]
