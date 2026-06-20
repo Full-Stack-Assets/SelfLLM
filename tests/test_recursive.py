@@ -180,6 +180,107 @@ class TestRecursiveTrainer:
         # High-confidence traces were produced for both eval prompts -> training ran.
         assert not torch.equal(before, after)
 
+    def test_reward_model_step(
+        self,
+        model: SelfImprovingLLM,
+        tokenizer: BPETokenizer,
+        recursive_config: RecursiveConfig,
+        device: str,
+        monkeypatch,
+    ) -> None:
+        """The reward-model step trains a persistent reward model and records metrics."""
+        fixed_pairs = [
+            {"prompt": "Q1 ", "chosen": "good helpful correct",
+             "rejected": "bad wrong unhelpful"},
+            {"prompt": "Q2 ", "chosen": "the preferred answer here",
+             "rejected": "the worse answer here"},
+        ]
+        # Avoid real generation (deterministic + branch-independent).
+        monkeypatch.setattr(
+            "selfllm.training.dpo_trainer.DPOTrainer.generate_preferences",
+            lambda self, *a, **k: fixed_pairs,
+        )
+        recursive_config.use_reward_model = True
+        recursive_config.reward_model_epochs = 3
+        trainer = RecursiveSelfTrainer(
+            model.to(device), tokenizer, recursive_config, device=device
+        )
+        assert trainer.reward_trainer is None
+        scores = trainer._run_reward_model_step()
+
+        assert "reward_accuracy" in scores and "reward_margin" in scores
+        assert 0.0 <= scores["reward_accuracy"] <= 1.0
+        # Reward model persists across iterations (same object reused).
+        rt = trainer.reward_trainer
+        assert rt is not None
+        trainer._run_reward_model_step()
+        assert trainer.reward_trainer is rt
+
+    def test_reward_guided_selection(
+        self,
+        model: SelfImprovingLLM,
+        tokenizer: BPETokenizer,
+        recursive_config: RecursiveConfig,
+        device: str,
+    ) -> None:
+        """Reward-guided selection keeps the highest-reward samples."""
+        recursive_config.reward_keep_fraction = 0.5
+        trainer = RecursiveSelfTrainer(
+            model.to(device), tokenizer, recursive_config, device=device
+        )
+
+        class _StubRT:  # score = text length -> longer responses score higher
+            def score(self, text):
+                return float(len(text))
+
+        trainer.reward_trainer = _StubRT()
+        samples = [
+            {"prompt": "p", "response": "a"},
+            {"prompt": "p", "response": "aa"},
+            {"prompt": "p", "response": "aaa"},
+            {"prompt": "p", "response": "aaaa"},
+        ]
+        kept = trainer._reward_select(samples)
+        assert len(kept) == 2  # top 50%
+        assert {s["response"] for s in kept} == {"aaaa", "aaa"}
+
+    def test_reward_model_persisted_in_checkpoint(
+        self,
+        model: SelfImprovingLLM,
+        tokenizer: BPETokenizer,
+        recursive_config: RecursiveConfig,
+        device: str,
+        monkeypatch,
+        tmp_path,
+    ) -> None:
+        """The reward model is saved alongside the policy checkpoint."""
+        import os
+
+        monkeypatch.setattr(
+            "selfllm.training.dpo_trainer.DPOTrainer.generate_preferences",
+            lambda self, *a, **k: [
+                {"prompt": "p ", "chosen": "good helpful answer", "rejected": "bad wrong"},
+                {"prompt": "q ", "chosen": "the preferred reply", "rejected": "the worse reply"},
+            ],
+        )
+        recursive_config.use_reward_model = True
+        recursive_config.checkpoint_dir = str(tmp_path)
+        trainer = RecursiveSelfTrainer(
+            model.to(device), tokenizer, recursive_config, device=device
+        )
+        trainer.run_iteration()
+        assert trainer.reward_trainer is not None
+
+        # Force the second iteration to be accepted so a checkpoint is written.
+        monkeypatch.setattr(
+            trainer.evaluator, "compute_improvement_delta", lambda **k: 1.0
+        )
+        m2 = trainer.run_iteration()
+        ckpt = m2["checkpoint_path"]
+        assert ckpt and os.path.exists(os.path.join(ckpt, "reward_model.pt"))
+        # The persisted reward model reloads cleanly.
+        trainer.reward_trainer.load(os.path.join(ckpt, "reward_model.pt"))
+
     # ------------------------------------------------------------------
     # 1. One iteration completes
     # ------------------------------------------------------------------

@@ -108,6 +108,9 @@ class RecursiveSelfTrainer:
         self.best_metrics: Optional[Dict[str, float]] = None
         self.best_checkpoint_path: Optional[str] = None
         self.metrics_history: List[Dict[str, float]] = []
+        # Persistent reward model (lazily created by _run_reward_model_step when
+        # use_reward_model is enabled), kept across iterations.
+        self.reward_trainer: Optional[Any] = None
 
         # Ensure checkpoint directory exists
         os.makedirs(self.config.checkpoint_dir, exist_ok=True)
@@ -208,6 +211,15 @@ class RecursiveSelfTrainer:
               f"({len(filtered_samples)} new + "
               f"{len(training_samples) - len(filtered_samples)} replay).")
 
+        # Step 3b: optional reward-guided selection -- keep the highest-reward
+        # samples (per the reward model trained in prior iterations).
+        if (
+            getattr(self.config, "use_reward_guided_selection", False)
+            and self.reward_trainer is not None
+            and len(training_samples) > 1
+        ):
+            training_samples = self._reward_select(training_samples)
+
         # Guard: skip training if no samples available
         if len(training_samples) == 0:
             print("  ⚠️  No training samples available. Skipping training step.")
@@ -300,6 +312,15 @@ class RecursiveSelfTrainer:
                 )
                 print(f"[Step 7/7] Saving checkpoint to {checkpoint_path} ...")
                 self.model.save_pretrained(checkpoint_path)
+                # Persist the reward model alongside the policy so it survives
+                # restarts and rollbacks (kept consistent with this checkpoint).
+                if self.reward_trainer is not None:
+                    try:
+                        self.reward_trainer.save(
+                            os.path.join(checkpoint_path, "reward_model.pt")
+                        )
+                    except Exception as e:  # pragma: no cover - defensive guard
+                        print(f"  ⚠️  Failed to save reward model ({e}); continuing.")
                 self.best_checkpoint_path = checkpoint_path
 
                 # Enforce the checkpoint retention policy.
@@ -318,6 +339,17 @@ class RecursiveSelfTrainer:
 
             self.model = SelfImprovingLLM.from_pretrained(self.best_checkpoint_path)
             self.model.to(self.device)
+
+            # Roll the reward model back to the same checkpoint, if one was saved.
+            if self.reward_trainer is not None:
+                reward_path = os.path.join(
+                    self.best_checkpoint_path, "reward_model.pt"
+                )
+                if os.path.exists(reward_path):
+                    try:
+                        self.reward_trainer.load(reward_path)
+                    except Exception as e:  # pragma: no cover - defensive guard
+                        print(f"  ⚠️  Failed to reload reward model ({e}); continuing.")
 
             # Re-create evaluator with rolled-back model
             self.evaluator = SelfImprovementEvaluator(
@@ -340,6 +372,11 @@ class RecursiveSelfTrainer:
         ):
             benchmark_scores = self._run_benchmarks()
 
+        # Step 6c: optional reward-model update on self-critic preferences.
+        reward_scores: Dict[str, float] = {}
+        if getattr(self.config, "use_reward_model", False):
+            reward_scores = self._run_reward_model_step()
+
         iter_duration = time.time() - iter_start_time
 
         # Build and store metrics dict
@@ -358,8 +395,9 @@ class RecursiveSelfTrainer:
             "checkpoint_path": checkpoint_path,
             "duration_seconds": iter_duration,
         }
-        # Merge benchmark scores (benchmark_<name>) into the iteration record.
+        # Merge benchmark + reward scores into the iteration record.
         iteration_metrics.update(benchmark_scores)
+        iteration_metrics.update(reward_scores)
         self.metrics_history.append(iteration_metrics)
 
         # Save metrics to JSON
@@ -879,6 +917,90 @@ class RecursiveSelfTrainer:
         except Exception as e:  # pragma: no cover - defensive guard
             print(f"  ⚠️  Reasoning distillation failed "
                   f"({type(e).__name__}: {e}); continuing.")
+
+    def _run_reward_model_step(self) -> Dict[str, float]:
+        """Update a persistent reward model on self-critic preference pairs.
+
+        Builds preference pairs over the eval prompts (DPO self-critic ranking),
+        trains the reward model with the Bradley-Terry objective, and returns its
+        ranking accuracy/margin as ``reward_accuracy`` / ``reward_margin`` to
+        record in the metrics. The reward model persists across iterations on
+        ``self.reward_trainer`` so it improves alongside the policy. Guarded.
+        """
+        try:
+            import copy
+
+            from ..training.dpo_trainer import DPOTrainer
+            from ..training.ppo_trainer import RewardModel
+            from ..training.reward_trainer import RewardModelTrainer
+
+            print("[Step 6c] Updating reward model on self-critic preferences...")
+            # Lazily create the reward model (a copy of the current policy with a
+            # scalar head) and keep its trainer across iterations.
+            if getattr(self, "reward_trainer", None) is None:
+                reward_model = RewardModel(copy.deepcopy(self.model))
+                self.reward_trainer = RewardModelTrainer(
+                    reward_model, self.tokenizer,
+                    learning_rate=self.config.learning_rate,
+                    batch_size=self.config.batch_size, device=self.device,
+                )
+
+            pairs = DPOTrainer(
+                self.model, self.tokenizer, device=self.device
+            ).generate_preferences(
+                self.config.eval_prompts,
+                num_samples=self.config.reward_num_samples,
+                temperature=self.config.generation_temperature,
+                top_p=self.config.generation_top_p,
+            )
+            if not pairs:
+                print("  No preference pairs generated; skipping reward update.")
+                return {}
+
+            self.reward_trainer.train_step(
+                pairs, num_epochs=self.config.reward_model_epochs
+            )
+            metrics = self.reward_trainer.evaluate(pairs)
+            print(f"  Reward model: accuracy={metrics['accuracy']:.4f}, "
+                  f"margin={metrics['reward_margin']:.4f} ({len(pairs)} pairs)")
+            return {
+                "reward_accuracy": metrics["accuracy"],
+                "reward_margin": metrics["reward_margin"],
+            }
+        except Exception as e:  # pragma: no cover - defensive guard
+            print(f"  ⚠️  Reward-model step failed "
+                  f"({type(e).__name__}: {e}); continuing.")
+            return {}
+
+    def _reward_select(self, samples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Keep the top ``reward_keep_fraction`` of samples by reward-model score.
+
+        Scores each ``prompt + response`` with the persistent reward model and
+        retains the highest-scoring fraction, so the model fine-tunes on its own
+        best (highest-reward) generations. Guarded: on any failure all samples
+        are kept.
+        """
+        try:
+            keep_fraction = getattr(self.config, "reward_keep_fraction", 0.7)
+            scored = [
+                (
+                    self.reward_trainer.score(
+                        s.get("prompt", "") + s.get("response", "")
+                    ),
+                    s,
+                )
+                for s in samples
+            ]
+            scored.sort(key=lambda pair: pair[0], reverse=True)
+            n_keep = max(1, int(len(scored) * keep_fraction))
+            selected = [s for _, s in scored[:n_keep]]
+            print(f"  [Step 3b] Reward-guided selection: kept "
+                  f"{len(selected)}/{len(samples)} highest-reward samples.")
+            return selected
+        except Exception as e:  # pragma: no cover - defensive guard
+            print(f"  ⚠️  Reward-guided selection failed "
+                  f"({type(e).__name__}: {e}); using all samples.")
+            return samples
 
     def _save_metrics_history(self) -> None:
         """Persist the full metrics history to JSON in the checkpoint dir."""

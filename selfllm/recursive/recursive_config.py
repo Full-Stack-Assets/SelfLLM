@@ -120,3 +120,19 @@ class RecursiveConfig:
     distillation_num_samples: int = 5       # self-consistency chains per prompt
     distillation_confidence: float = 0.5    # keep traces with confidence >= this
     distillation_max_new_tokens: int = 64
+
+    # Reward model in the loop: each iteration, build self-critic preference
+    # pairs over the eval prompts and update a reward model (Bradley-Terry) on
+    # them, recording its ranking accuracy/margin in the metrics. The reward
+    # model is kept across iterations on the trainer (``reward_trainer``) so it
+    # improves alongside the policy and is available for reward-guided steps.
+    use_reward_model: bool = False
+    reward_model_epochs: int = 2
+    reward_num_samples: int = 4             # responses per prompt for pair-building
+
+    # Reward-guided selection: before training, score the candidate samples with
+    # the reward model and keep only the top ``reward_keep_fraction`` -- the
+    # model trains on its own highest-reward generations. Requires
+    # ``use_reward_model`` (uses the reward model trained in prior iterations).
+    use_reward_guided_selection: bool = False
+    reward_keep_fraction: float = 0.7

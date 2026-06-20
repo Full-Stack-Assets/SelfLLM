@@ -3,6 +3,7 @@ from .constitutional_ai import ConstitutionalAI
 from .data_generator import SelfTrainingDataGenerator
 from .dpo_trainer import DPOTrainer, PreferenceDataset
 from .ppo_trainer import PPOTrainer, RewardModel, ValueModel
+from .reward_trainer import RewardModelTrainer
 from .quality_filter import QualityFilter
 from .dataset import SelfTrainingDataset
 from .fsdp_trainer import FSDPConfig, FSDPTrainer
@@ -15,6 +16,7 @@ __all__ = [
     "PPOTrainer",
     "PreferenceDataset",
     "RewardModel",
+    "RewardModelTrainer",
     "ValueModel",
     "FSDPConfig",
     "FSDPTrainer",
