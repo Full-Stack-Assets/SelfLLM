@@ -467,7 +467,7 @@ def create_dashboard(
                         ],
                         label="Iteration Log",
                     )
-                    si_plot = gr.LinePlot(
+                    gr.LinePlot(
                         x="Iteration",
                         y="Loss",
                         title="Loss Curve",

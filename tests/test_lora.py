@@ -1,6 +1,5 @@
 """Unit tests for the LoRA (Low-Rank Adaptation) module."""
 
-import math
 import os
 import tempfile
 
@@ -111,7 +110,7 @@ class TestLoRALayer:
         )
         x = torch.randn(2, 16)
         layer.train()
-        out_train = layer(x)
+        layer(x)
 
         layer.eval()
         # With dropout=0.5 and B=0, even in train mode the output is zero

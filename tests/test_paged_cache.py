@@ -1,6 +1,5 @@
 """Tests for PagedAttention KV cache management (paged_cache.py)."""
 
-import math
 
 import pytest
 import torch

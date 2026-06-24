@@ -9,10 +9,9 @@ Tests cover:
 """
 
 import sys
-from typing import Dict, List
+from typing import List
 
 import pytest
-import torch
 
 sys.path.insert(0, "/home/kimi/work-constitutional")
 

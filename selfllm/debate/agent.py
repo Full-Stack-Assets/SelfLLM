@@ -1,7 +1,7 @@
 """Debate agent: an LLM wrapped with a distinct perspective and sampling params."""
 
 import re
-from typing import List, Optional
+from typing import List
 
 import torch
 

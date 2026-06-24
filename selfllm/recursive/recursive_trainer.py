@@ -188,8 +188,8 @@ class RecursiveSelfTrainer:
         # Adaptive fallback: if filtering produces too few samples, lower threshold
         min_samples_needed = max(1, int(self.config.samples_per_iteration * self.config.keep_ratio * 0.25))
         if samples_kept < min_samples_needed:
-            print(f"  ⚠️  Too few samples passed filtering. "
-                  f"Adaptive fallback: lowering threshold ...")
+            print("  ⚠️  Too few samples passed filtering. "
+                  "Adaptive fallback: lowering threshold ...")
             # Retry with more lenient parameters
             filtered_samples = self.quality_filter.filter_batch(
                 samples=raw_samples,
@@ -285,14 +285,14 @@ class RecursiveSelfTrainer:
             self._run_reasoning_distillation_step()
 
         # Step 5: Evaluate
-        print(f"[Step 5/7] Running evaluation suite ...")
+        print("[Step 5/7] Running evaluation suite ...")
         eval_metrics = self.evaluator.full_evaluation()
         print(f"  Perplexity: {eval_metrics['perplexity']:.2f}")
         print(f"  Quality:    {eval_metrics['overall_quality']:.4f}")
         print(f"  Consistency: {eval_metrics['self_consistency']:.4f}")
 
         # Step 6: Compute improvement delta
-        print(f"[Step 6/7] Computing improvement delta ...")
+        print("[Step 6/7] Computing improvement delta ...")
         improvement_delta = self.evaluator.compute_improvement_delta(
             current_metrics=eval_metrics,
             previous_metrics=self.best_metrics,
@@ -360,7 +360,7 @@ class RecursiveSelfTrainer:
             )
             checkpoint_path = self.best_checkpoint_path
         else:
-            print(f"[Step 7/7] Degradation detected, rollback disabled or no best checkpoint.")
+            print("[Step 7/7] Degradation detected, rollback disabled or no best checkpoint.")
             checkpoint_path = self.best_checkpoint_path or ""
 
         # Step 6b: optional eval-suite benchmark hook (MMLU/GSM8K/HumanEval).
@@ -556,7 +556,7 @@ class RecursiveSelfTrainer:
             List of iteration metrics dicts.
         """
         print(f"\n{'#' * 60}")
-        print(f"#  Starting Recursive Self-Improvement Loop")
+        print("#  Starting Recursive Self-Improvement Loop")
         print(f"#  max_iterations={max_iterations}")
         print(f"#  target_improvement={target_improvement}")
         print(f"#  patience={patience}")
@@ -693,13 +693,13 @@ class RecursiveSelfTrainer:
     def _print_final_summary(self) -> None:
         """Print a final summary of the recursive improvement loop."""
         print(f"\n{'#' * 60}")
-        print(f"#  Recursive Self-Improvement Complete")
+        print("#  Recursive Self-Improvement Complete")
         print(f"{'#' * 60}")
         print(f"  Total iterations: {len(self.metrics_history)}")
         print(f"  Best checkpoint: {self.best_checkpoint_path or 'N/A'}")
 
         if self.best_metrics:
-            print(f"\n  Best metrics:")
+            print("\n  Best metrics:")
             for key, value in self.best_metrics.items():
                 if isinstance(value, float):
                     print(f"    {key}: {value:.4f}")
@@ -711,7 +711,7 @@ class RecursiveSelfTrainer:
             last = self.metrics_history[-1]
             ppl_change = last["eval_perplexity"] - first["eval_perplexity"]
             quality_change = last["quality_score"] - first["quality_score"]
-            print(f"\n  Overall change:")
+            print("\n  Overall change:")
             print(f"    Perplexity: {ppl_change:+.4f} "
                   f"({first['eval_perplexity']:.2f} -> {last['eval_perplexity']:.2f})")
             print(f"    Quality:    {quality_change:+.4f} "
@@ -723,7 +723,7 @@ class RecursiveSelfTrainer:
             benchmark_keys = detect_benchmark_keys(self.metrics_history)
             if benchmark_keys:
                 summary = summarize_metrics(self.metrics_history)
-                print(f"\n  Benchmarks (first -> last):")
+                print("\n  Benchmarks (first -> last):")
                 for key in benchmark_keys:
                     if key in summary:
                         s = summary[key]

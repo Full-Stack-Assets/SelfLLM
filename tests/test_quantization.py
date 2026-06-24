@@ -7,7 +7,6 @@ import tempfile
 import pytest
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from selfllm.model.config import ModelConfig
 from selfllm.model.model import SelfImprovingLLM
@@ -165,7 +164,6 @@ class TestQuantizeModel:
 
     def test_memory_savings_4bit(self, tiny_model):
         """4-bit quantization should reduce model size by at least 50%."""
-        import io
         from selfllm.model.quantization import _get_model_size_mb
 
         orig_size = _get_model_size_mb(tiny_model)

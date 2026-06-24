@@ -42,13 +42,13 @@ import json
 import logging
 import os
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from .harness import EvalResult, Evaluator, comparison_report
-from .mmlu import MMLUBenchmark, MMLUExample
-from .gsm8k import GSM8KBenchmark, GSM8KExample
-from .humaneval import HumanEvalBenchmark, HumanEvalProblem
+from .harness import EvalResult, Evaluator
+from .mmlu import MMLUBenchmark
+from .gsm8k import GSM8KBenchmark
+from .humaneval import HumanEvalBenchmark
 
 logger = logging.getLogger(__name__)
 

@@ -23,7 +23,6 @@ import textwrap
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import torch
 import yaml
 
 from selfllm.utils import get_device, set_seed, Logger, format_num
@@ -940,7 +939,7 @@ def cmd_real_training(cfg: Dict[str, Any], logger: Logger) -> None:
         seed=seed,
     )
 
-    logger.info(f"Real training complete!")
+    logger.info("Real training complete!")
     logger.info(f"  Total parameters: {format_num(results['total_parameters'])}")
     logger.info(f"  Pre-train loss: {results['pretrain_loss']:.4f}")
     logger.info(f"  Books downloaded: {results['num_books']}")

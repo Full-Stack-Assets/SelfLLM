@@ -3,7 +3,6 @@
 import threading
 import time
 from types import SimpleNamespace
-from typing import Any, Dict, List
 from unittest.mock import MagicMock
 
 import pytest
@@ -418,7 +417,7 @@ class TestServerEndpoints:
     def client(self, mock_model, mock_tokenizer, monkeypatch):
         """Create a TestClient with mocked global state."""
         from fastapi.testclient import TestClient
-        from selfllm.serving.server import app, _model, _tokenizer, _scheduler
+        from selfllm.serving.server import app
 
         # We need to reload the module to pick up the app
         import selfllm.serving.server as server_module
@@ -798,7 +797,7 @@ class TestEndToEnd:
         assert len(req.generated_tokens) == 2
 
         # Third step: finished (max length reached)
-        completed = scheduler.step()
+        scheduler.step()
         assert req.status == "finished"
         assert req.is_finished
         assert req.finished_at is not None
@@ -827,7 +826,7 @@ class TestEndToEnd:
         """Blocks are freed when a request completes."""
         initial_free = scheduler.block_manager.num_free_blocks
 
-        req = scheduler.create_request(prompt_tokens=[1, 2, 3], max_new_tokens=1)
+        scheduler.create_request(prompt_tokens=[1, 2, 3], max_new_tokens=1)
         scheduler.step()  # Completes, frees blocks
 
         # All blocks should be returned

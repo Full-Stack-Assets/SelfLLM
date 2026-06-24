@@ -5,7 +5,6 @@ from typing import Any, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from .attention import RoPEMultiHeadAttention
 from .flash_attention import HybridAttention
 from .config import ModelConfig
 

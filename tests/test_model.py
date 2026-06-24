@@ -15,7 +15,6 @@ import torch
 
 from selfllm.model.config import ModelConfig
 from selfllm.model.model import SelfImprovingLLM
-from selfllm.model.tokenizer import BPETokenizer
 from selfllm.utils import count_parameters, format_num
 
 

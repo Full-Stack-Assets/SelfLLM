@@ -12,8 +12,6 @@ Tests cover:
 import sys
 import pytest
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from typing import Dict, List
 
 # Ensure project root is importable
@@ -104,7 +102,6 @@ def test_dpo_loss_computation(tiny_model: SelfImprovingLLM, tokenizer: BPETokeni
         device="cpu",
     )
 
-    batch_size = 4
     # Simulate: policy strongly prefers chosen
     policy_chosen = torch.tensor([0.0, -0.5, -1.0, -0.2])
     policy_rejected = torch.tensor([-2.0, -1.5, -3.0, -1.8])
