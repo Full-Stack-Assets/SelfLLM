@@ -192,11 +192,9 @@ class QuantizedLinear(nn.Module):
         scales = self.scales.to(q.device)[group_indices]
         zeros = self.zeros.to(q.device)[group_indices]
 
-        # Dequantize: w = (q / (2**self.bits - 1)) * scale + zero_point  ... wait, standard is:
-        # w = (q - zp) * scale, where zp is the zero-point in quantized space
-        # We stored zero_point as w_min, and scale = (w_max - w_min) / qmax
-        # q = round((w - w_min) / scale)
-        # So w = q * scale + w_min = q * scale + zero_point
+        # Dequantize from packed integer values using the stored per-group
+        # scale and zero-point values. The quantized tensor is reconstructed as:
+        # weight = q * scale + zero_point
         weight = q.float() * scales + zeros
 
         # Reshape to original matrix shape

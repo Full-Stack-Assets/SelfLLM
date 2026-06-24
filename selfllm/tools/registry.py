@@ -252,7 +252,7 @@ class ToolRegistry:
             if isinstance(op, ast.Mod):
                 return left % right
             if isinstance(op, ast.Pow):
-                return left**right
+                return left ** right
             raise ValueError("unsupported operator")
         if isinstance(node, ast.UnaryOp):
             operand = cls._eval_calc_node(node.operand)
