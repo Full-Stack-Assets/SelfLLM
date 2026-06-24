@@ -8,6 +8,7 @@ Provides subcommands for the full model lifecycle:
     python -m selfllm generate       # Generate text from trained model
     python -m selfllm evaluate       # Evaluate model quality
     python -m selfllm benchmark      # MMLU / GSM8K / HumanEval (+ reasoning lift)
+    python -m selfllm dashboard      # Launch browser-based model UI
     python -m selfllm serve          # Launch OpenAI-compatible API server
 
 Configuration can be provided via ``--config`` (YAML) and/or individual CLI
@@ -148,6 +149,10 @@ def merge_config(yaml_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dict
         _v = getattr(cli_args, _k, None)
         if _v is not None:
             merged[_k] = _v
+    if getattr(cli_args, "share", None) is not None:
+        merged["share"] = cli_args.share
+    if getattr(cli_args, "dashboard_config_path", None) is not None:
+        merged["dashboard_config_path"] = cli_args.dashboard_config_path
     merged["model_path"] = getattr(cli_args, "model_path", None) or yaml_cfg.get("model_path", "")
     merged["tokenizer_path"] = getattr(cli_args, "tokenizer_path", None) or yaml_cfg.get("tokenizer_path", "")
     if getattr(cli_args, "num_iterations", None) is not None:
@@ -183,6 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
               %(prog)s self-improve --model-path ./checkpoints/base --max-iterations 10
               %(prog)s generate --model-path ./checkpoints/best --prompt "Explain recursion"
               %(prog)s evaluate --model-path ./checkpoints/best --eval-data data/eval.txt
+              %(prog)s dashboard --model-path ./checkpoints/best --tokenizer-path ./checkpoints/tokenizer.json --port 7860
               %(prog)s serve --model-path ./checkpoints/best --tokenizer-path ./checkpoints/tokenizer --port 8000
         """),
     )
@@ -437,6 +443,55 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve_parser.add_argument(
         "--max-batch-size", type=int, default=32, help="Maximum concurrent batch size (default: 32)."
+    )
+
+    # ------------------------------------------------------------------
+    # dashboard
+    # ------------------------------------------------------------------
+    dashboard_parser = subparsers.add_parser(
+        "dashboard",
+        help="Launch the browser-based SelfLLM user interface.",
+        description=(
+            "Open a Gradio web UI for chatting with a local SelfLLM checkpoint, "
+            "generating completions, and monitoring training metrics."
+        ),
+    )
+    dashboard_parser.add_argument(
+        "--model-path",
+        type=str,
+        default=None,
+        help="Optional checkpoint directory to load at startup.",
+    )
+    dashboard_parser.add_argument(
+        "--tokenizer-path",
+        type=str,
+        default=None,
+        help="Optional tokenizer JSON/file path to load at startup.",
+    )
+    dashboard_parser.add_argument(
+        "--host",
+        type=str,
+        default="0.0.0.0",
+        help="Host to bind the UI server to (default: 0.0.0.0).",
+    )
+    dashboard_parser.add_argument(
+        "--port",
+        type=int,
+        default=7860,
+        help="Port to listen on (default: 7860).",
+    )
+    dashboard_parser.add_argument(
+        "--share",
+        action="store_true",
+        default=False,
+        help="Create a public Gradio share link.",
+    )
+    dashboard_parser.add_argument(
+        "--config-path",
+        dest="dashboard_config_path",
+        type=str,
+        default=None,
+        help="YAML file edited by the Settings tab (default: ./selfllm/config.yaml).",
     )
 
     # ------------------------------------------------------------------
@@ -1166,6 +1221,49 @@ def cmd_evaluate(cfg: Dict[str, Any], logger: Logger) -> None:
         logger.info(f"Results saved to {output_path}")
 
 
+def cmd_dashboard(cfg: Dict[str, Any], logger: Logger) -> None:
+    """Launch the Gradio web UI for the current LLM."""
+    from selfllm.dashboard import _load_model, launch_dashboard
+
+    host = cfg.get("host") or "0.0.0.0"
+    port = cfg.get("port") or int(os.environ.get("PORT") or 7860)
+    share = bool(cfg.get("share", False))
+    model_path = cfg.get("model_path", "")
+    tokenizer_path = cfg.get("tokenizer_path", "")
+    config_path = cfg.get("dashboard_config_path") or "./selfllm/config.yaml"
+    checkpoint_dir = cfg.get("checkpoint_dir", "./checkpoints")
+
+    model = None
+    tokenizer = None
+    if model_path:
+        logger.info(f"Loading dashboard model: {model_path}")
+        model, tokenizer, message = _load_model(
+            model_path,
+            tokenizer_path or None,
+            device=cfg["device"],
+        )
+        if model is None or tokenizer is None:
+            logger.error(message)
+            sys.exit(1)
+        logger.info(message)
+    elif tokenizer_path:
+        logger.warning("--tokenizer-path was provided without --model-path; starting without a loaded model.")
+
+    logger.info(f"Starting dashboard on {host}:{port}")
+    launch_dashboard(
+        model=model,
+        tokenizer=tokenizer,
+        host=host,
+        port=port,
+        share=share,
+        config_path=config_path,
+        checkpoint_dir=checkpoint_dir,
+        model_path=model_path or None,
+        tokenizer_path=tokenizer_path or None,
+        device=cfg["device"],
+    )
+
+
 def cmd_serve(cfg: Dict[str, Any], logger: Logger) -> None:
     """Launch the OpenAI-compatible API server with PagedAttention backend."""
     from selfllm.serving.server import serve
@@ -1255,6 +1353,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "generate": cmd_generate,
         "evaluate": cmd_evaluate,
         "benchmark": cmd_benchmark,
+        "dashboard": cmd_dashboard,
         "serve": cmd_serve,
     }
 

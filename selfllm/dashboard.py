@@ -4,7 +4,7 @@ import json
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import gradio as gr
 import torch
@@ -34,6 +34,9 @@ class DashboardState:
         self.iteration_logs: List[Dict[str, Any]] = []
         self.training_logs: List[Dict[str, float]] = []
         self.eval_results: Optional[Dict[str, Any]] = None
+        self.model_path: Optional[str] = None
+        self.tokenizer_path: Optional[str] = None
+        self.device: Optional[str] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -57,32 +60,144 @@ def _save_config(config_path: str, config: Dict[str, Any]) -> str:
     return f"Configuration saved to {config_path}"
 
 
-def _load_model_from_dir(
-    model_dir: str, device: str = "cpu"
-) -> tuple[Optional[SelfImprovingLLM], Optional[BPETokenizer]]:
-    """Load a model and tokenizer from a checkpoint directory."""
+def _candidate_tokenizer_paths(
+    model_dir: str, tokenizer_path: Optional[str] = None
+) -> Sequence[str]:
+    """Return possible tokenizer files in priority order."""
+    candidates: List[str] = []
+    if tokenizer_path:
+        candidates.append(tokenizer_path)
+    candidates.extend(
+        [
+            os.path.join(model_dir, "tokenizer.json"),
+            os.path.join(model_dir, "tokenizer"),
+        ]
+    )
+    return candidates
+
+
+def _load_model(
+    model_path: str,
+    tokenizer_path: Optional[str] = None,
+    device: str = "cpu",
+) -> tuple[Optional[SelfImprovingLLM], Optional[BPETokenizer], str]:
+    """Load a model and tokenizer from paths used by the CLI and UI."""
     try:
+        model_dir = (model_path or "").strip()
+        if not model_dir:
+            return None, None, "Model path is required."
+        if not os.path.isdir(model_dir):
+            return None, None, f"Model directory not found: {model_dir}"
+
         config_path = os.path.join(model_dir, "config.json")
         if not os.path.exists(config_path):
-            return None, None
-        with open(config_path, "r") as f:
+            return None, None, f"Missing model config: {config_path}"
+        with open(config_path, "r", encoding="utf-8") as f:
             config_dict = json.load(f)
         config = ModelConfig(**config_dict)
         model = SelfImprovingLLM(config).to(device)
+
         weights_path = os.path.join(model_dir, "pytorch_model.bin")
-        if os.path.exists(weights_path):
-            state_dict = torch.load(
-                weights_path, map_location=device, weights_only=True
+        if not os.path.exists(weights_path):
+            return None, None, f"Missing model weights: {weights_path}"
+        state_dict = torch.load(
+            weights_path, map_location=device, weights_only=True
+        )
+        model.load_state_dict(state_dict)
+        model.eval()
+
+        tok_path = next(
+            (
+                path for path in _candidate_tokenizer_paths(
+                    model_dir, (tokenizer_path or "").strip() or None
+                )
+                if os.path.isfile(path)
+            ),
+            None,
+        )
+        if tok_path is None:
+            return (
+                None,
+                None,
+                "Tokenizer not found. Provide a tokenizer file or place "
+                "`tokenizer.json` beside the model checkpoint.",
             )
-            model.load_state_dict(state_dict)
         tokenizer = BPETokenizer(vocab_size=config.vocab_size)
-        tok_path = os.path.join(model_dir, "tokenizer.json")
-        if os.path.exists(tok_path):
-            tokenizer.load(tok_path)
-        return model, tokenizer
+        tokenizer.load(tok_path)
+
+        params = sum(p.numel() for p in model.parameters())
+        message = (
+            f"Loaded {params:,} parameter model from {model_dir} "
+            f"with tokenizer {tok_path} on {device}."
+        )
+        return model, tokenizer, message
     except Exception as exc:  # noqa: BLE001
-        print(f"Error loading model: {exc}")
-        return None, None
+        return None, None, f"Failed to load model: {exc}"
+
+
+def _load_model_from_dir(
+    model_dir: str, device: str = "cpu"
+) -> tuple[Optional[SelfImprovingLLM], Optional[BPETokenizer]]:
+    """Backward-compatible wrapper for loading a checkpoint directory."""
+    model, tokenizer, _ = _load_model(model_dir, device=device)
+    return model, tokenizer
+
+
+def _set_loaded_model(
+    state: DashboardState,
+    model: SelfImprovingLLM,
+    tokenizer: BPETokenizer,
+    model_path: Optional[str],
+    tokenizer_path: Optional[str],
+    device: str,
+) -> None:
+    """Store a loaded model and its display metadata in dashboard state."""
+    state.model = model
+    state.tokenizer = tokenizer
+    state.model_path = model_path
+    state.tokenizer_path = tokenizer_path
+    state.device = device
+
+
+def _model_status(state: DashboardState) -> str:
+    """Render the current model status for the dashboard header."""
+    if state.model is None or state.tokenizer is None:
+        return (
+            "**Model status:** No model loaded. Load a checkpoint in Settings "
+            "or launch with `selfllm dashboard --model-path ... --tokenizer-path ...`."
+        )
+    params = sum(p.numel() for p in state.model.parameters())
+    config = getattr(state.model, "config", None)
+    parts = [
+        f"**Model status:** Loaded `{params:,}` parameters",
+        f"device `{state.device or next(state.model.parameters()).device}`",
+    ]
+    if config is not None:
+        parts.append(
+            f"context `{getattr(config, 'max_seq_len', 'unknown')}` tokens"
+        )
+    if state.model_path:
+        parts.append(f"checkpoint `{state.model_path}`")
+    return " | ".join(parts)
+
+
+def _format_chat_prompt(
+    message: str,
+    history: Optional[List[Tuple[str, str]]] = None,
+    system_prompt: str = "",
+) -> str:
+    """Convert chat turns into a plain text prompt for the base LLM."""
+    turns: List[str] = []
+    if system_prompt.strip():
+        turns.append(f"System: {system_prompt.strip()}")
+    for user_text, assistant_text in history or []:
+        if user_text:
+            turns.append(f"User: {user_text.strip()}")
+        if assistant_text:
+            turns.append(f"Assistant: {assistant_text.strip()}")
+    turns.append(f"User: {message.strip()}")
+    turns.append("Assistant:")
+    return "\n".join(turns)
 
 
 # --------------------------------------------------------------------------- #
@@ -102,6 +217,8 @@ def _handle_generate(
     """Handle text generation from the Generate tab."""
     if state.model is None or state.tokenizer is None:
         return "Error: No model loaded. Please load a model in the Settings tab or pass one at startup."
+    if not prompt.strip():
+        return "Error: Enter a prompt before generating."
 
     state.model.eval()
     device = next(state.model.parameters()).device
@@ -117,6 +234,7 @@ def _handle_generate(
             top_p=top_p,
             top_k=top_k,
             repetition_penalty=repetition_penalty,
+            stop_token_id=state.tokenizer.eos_token_id,
         )
 
     generated_ids = output["sequences"][0].cpu().tolist()
@@ -129,6 +247,47 @@ def _handle_generate(
         result = full_text.strip()
 
     return result
+
+
+def _handle_chat(
+    message: str,
+    history: Optional[List[Tuple[str, str]]],
+    system_prompt: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    repetition_penalty: float,
+    state: DashboardState,
+) -> tuple[List[Tuple[str, str]], str]:
+    """Handle one chat turn in the Chat tab."""
+    current_history = list(history or [])
+    if state.model is None or state.tokenizer is None:
+        current_history.append(
+            (
+                message,
+                "Error: No model loaded. Load a model in Settings or start "
+                "with `selfllm dashboard --model-path ... --tokenizer-path ...`.",
+            )
+        )
+        return current_history, ""
+    if not message.strip():
+        return current_history, ""
+
+    prompt = _format_chat_prompt(message, current_history, system_prompt)
+    response = _handle_generate(
+        prompt=prompt,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=int(max_tokens),
+        top_k=50,
+        repetition_penalty=repetition_penalty,
+        state=state,
+    )
+    if response.startswith("Error:"):
+        current_history.append((message, response))
+    else:
+        current_history.append((message, response.strip()))
+    return current_history, ""
 
 
 def _handle_self_improve_start(
@@ -333,6 +492,9 @@ def create_dashboard(
     tokenizer: Optional[BPETokenizer] = None,
     config_path: str = "./selfllm/config.yaml",
     checkpoint_dir: str = "./checkpoints",
+    model_path: Optional[str] = None,
+    tokenizer_path: Optional[str] = None,
+    device: Optional[str] = None,
 ) -> gr.Blocks:
     """Create and launch the Gradio dashboard.
 
@@ -362,6 +524,10 @@ def create_dashboard(
 
     # Initial state
     initial_state = DashboardState(model=model, tokenizer=tokenizer)
+    if model is not None and tokenizer is not None:
+        initial_state.model_path = model_path
+        initial_state.tokenizer_path = tokenizer_path
+        initial_state.device = device or str(next(model.parameters()).device)
 
     with gr.Blocks(title="SelfLLM Dashboard") as demo:
         state = gr.State(value=initial_state)
@@ -371,8 +537,77 @@ def create_dashboard(
             "Interactive dashboard for monitoring and controlling "
             "the SelfLLM self-improving language model."
         )
+        model_status = gr.Markdown(value=_model_status(initial_state))
 
         with gr.Tabs():
+            # ==================== Chat Tab ====================
+            with gr.TabItem("Chat"):
+                gr.Markdown("### Chat with the current SelfLLM checkpoint")
+                chat_history = gr.Chatbot(
+                    label="Conversation",
+                    height=420,
+                )
+                chat_input = gr.Textbox(
+                    label="Message",
+                    placeholder="Ask the loaded model anything...",
+                    lines=3,
+                )
+                with gr.Row():
+                    chat_send_btn = gr.Button("Send", variant="primary")
+                    chat_clear_btn = gr.Button("Clear")
+                with gr.Accordion("Generation settings", open=False):
+                    chat_system = gr.Textbox(
+                        label="System Prompt",
+                        value=(
+                            "You are SelfLLM, a helpful language model running "
+                            "from the local checkpoint."
+                        ),
+                        lines=2,
+                    )
+                    with gr.Row():
+                        chat_temperature = gr.Slider(
+                            0.0, 2.0, value=0.8, step=0.05,
+                            label="Temperature"
+                        )
+                        chat_top_p = gr.Slider(
+                            0.0, 1.0, value=0.92, step=0.01, label="Top-p"
+                        )
+                    with gr.Row():
+                        chat_max_tokens = gr.Slider(
+                            1, 1024, value=256, step=1,
+                            label="Max New Tokens"
+                        )
+                        chat_repetition = gr.Slider(
+                            1.0, 2.0, value=1.05, step=0.05,
+                            label="Repetition Penalty"
+                        )
+
+                chat_inputs = [
+                    chat_input,
+                    chat_history,
+                    chat_system,
+                    chat_temperature,
+                    chat_top_p,
+                    chat_max_tokens,
+                    chat_repetition,
+                    state,
+                ]
+                chat_send_btn.click(
+                    fn=_handle_chat,
+                    inputs=chat_inputs,
+                    outputs=[chat_history, chat_input],
+                )
+                chat_input.submit(
+                    fn=_handle_chat,
+                    inputs=chat_inputs,
+                    outputs=[chat_history, chat_input],
+                )
+                chat_clear_btn.click(
+                    fn=lambda: [],
+                    inputs=None,
+                    outputs=chat_history,
+                )
+
             # ==================== Generate Tab ====================
             with gr.TabItem("Generate"):
                 gr.Markdown("### Interactive Text Generation")
@@ -618,7 +853,12 @@ def create_dashboard(
                 cfg_model_dir = gr.Textbox(
                     label="Model Directory",
                     placeholder="./checkpoints/model_v1",
-                    value="./checkpoints/model_v1",
+                    value=checkpoint_dir,
+                )
+                cfg_tokenizer_path = gr.Textbox(
+                    label="Tokenizer File (optional)",
+                    placeholder="./checkpoints/model_v1/tokenizer.json",
+                    value="",
                 )
 
                 cfg_save_btn.click(
@@ -627,23 +867,35 @@ def create_dashboard(
                     outputs=cfg_status,
                 )
 
-                def _do_load_model(model_dir: str, state_val: DashboardState):
+                def _do_load_model(
+                    model_dir: str,
+                    tokenizer_file: str,
+                    state_val: DashboardState,
+                ):
                     device = "cuda" if torch.cuda.is_available() else "cpu"
-                    m, t = _load_model_from_dir(model_dir, device)
+                    m, t, message = _load_model(
+                        model_dir, tokenizer_file or None, device
+                    )
                     if m is not None and t is not None:
-                        state_val.model = m
-                        state_val.tokenizer = t
+                        _set_loaded_model(
+                            state_val,
+                            m,
+                            t,
+                            model_dir,
+                            tokenizer_file or None,
+                            device,
+                        )
                         return (
                             state_val,
-                            f"Model loaded from {model_dir} "
-                            f"({sum(p.numel() for p in m.parameters()):,} params)",
+                            message,
+                            _model_status(state_val),
                         )
-                    return state_val, f"Failed to load model from {model_dir}"
+                    return state_val, message, _model_status(state_val)
 
                 cfg_load_model_btn.click(
                     fn=_do_load_model,
-                    inputs=[cfg_model_dir, state],
-                    outputs=[state, cfg_status],
+                    inputs=[cfg_model_dir, cfg_tokenizer_path, state],
+                    outputs=[state, cfg_status, model_status],
                 )
 
     return demo
@@ -652,6 +904,7 @@ def create_dashboard(
 def launch_dashboard(
     model: Optional[SelfImprovingLLM] = None,
     tokenizer: Optional[BPETokenizer] = None,
+    host: str = "0.0.0.0",
     port: int = 7860,
     share: bool = False,
     **kwargs: Any,
@@ -661,6 +914,7 @@ def launch_dashboard(
     Args:
         model: Optional pre-loaded model.
         tokenizer: Optional pre-loaded tokenizer.
+        host: Host/IP for the Gradio server.
         port: Port number for the Gradio server.
         share: Whether to create a public shareable link.
         **kwargs: Additional arguments passed to ``create_dashboard``.
@@ -668,7 +922,7 @@ def launch_dashboard(
     demo = create_dashboard(
         model=model, tokenizer=tokenizer, **kwargs
     )
-    demo.launch(server_name="0.0.0.0", server_port=port, share=share)
+    demo.launch(server_name=host, server_port=port, share=share)
 
 
 if __name__ == "__main__":
