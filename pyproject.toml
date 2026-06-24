@@ -1,12 +1,39 @@
-# Project packaging is still driven by setup.py; intentionally no
-# [build-system] table here so the legacy setuptools backend keeps building
-# the package from setup.py.
+# Vercel's Python builder runs `uv`, which requires a [project] table here.
+# Package builds for distribution are still handled by setup.py; this file
+# exists primarily to declare the Vercel deployment entrypoint and to give uv
+# a resolvable project + dependency set for the deployment environment.
+
+[project]
+name = "selfllm"
+version = "0.1.0"
+description = "A recursively self-improving foundation language model"
+readme = "README.md"
+requires-python = ">=3.9"
+# Mirrors requirements.txt -- the dependency set the deployment installs.
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+    "tqdm>=4.65.0",
+    "pyyaml>=6.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "httpx>=0.24.0",
+    "gradio>=4.0.0",
+    "jinja2>=3.1.6",
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[tool.uv]
+# Don't try to build/install the selfllm package itself; uv only needs to
+# resolve and install the dependencies above. The application code is imported
+# from the repository root, matching the prior requirements.txt-based build.
+package = false
 
 # Vercel deployment configuration.
 #
-# Tells the Vercel Python builder which ASGI application to serve. The
-# FastAPI `app` is defined in selfllm/serving/server.py (and re-exported from
-# selfllm/serving/__init__.py); point at the defining module directly so the
-# import chain stays minimal at cold start.
+# Tells the Vercel Python builder which ASGI application to serve. The FastAPI
+# `app` is defined in selfllm/serving/server.py (and re-exported from
+# selfllm/serving/__init__.py); point at the defining module directly.
 [tool.vercel]
 entrypoint = "selfllm.serving.server:app"
