@@ -195,6 +195,39 @@ def test_serve_defaults():
     assert args.max_batch_size == 32
 
 
+def test_dashboard_defaults():
+    args = cli.build_parser().parse_args(["dashboard"])
+    assert args.command == "dashboard"
+    assert args.host == "0.0.0.0"
+    assert args.port == 7860
+    assert args.share is False
+    assert args.model_path is None
+    assert args.tokenizer_path is None
+
+
+def test_dashboard_model_startup_args():
+    args = cli.build_parser().parse_args(
+        [
+            "dashboard",
+            "--model-path",
+            "m",
+            "--tokenizer-path",
+            "t",
+            "--port",
+            "9000",
+            "--share",
+            "--config-path",
+            "ui.yaml",
+        ]
+    )
+    assert args.command == "dashboard"
+    assert args.model_path == "m"
+    assert args.tokenizer_path == "t"
+    assert args.port == 9000
+    assert args.share is True
+    assert args.dashboard_config_path == "ui.yaml"
+
+
 def test_invalid_device_choice_rejected():
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(["--device", "tpu", "init"])
