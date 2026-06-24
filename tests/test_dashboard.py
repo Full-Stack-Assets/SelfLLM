@@ -15,6 +15,8 @@ class _TinyTokenizer:
         return [10, 20]
 
     def decode(self, token_ids: list[int]) -> str:
+        if token_ids == [30, 31]:
+            return "Hello from SelfLLM"
         if token_ids == [10, 20, 30, 31]:
             return f"{self.last_prompt} Hello from SelfLLM"
         return "decoded"
@@ -52,6 +54,19 @@ def test_format_chat_prompt_includes_system_history_and_next_assistant_turn():
     )
 
 
+def test_messages_to_turns_converts_gradio_messages():
+    turns = dashboard._messages_to_turns(
+        [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+            {"role": "user", "content": "Next"},
+            {"role": "assistant", "content": "Done"},
+        ]
+    )
+
+    assert turns == [("Hi", "Hello"), ("Next", "Done")]
+
+
 def test_handle_chat_reports_missing_model():
     state = dashboard.DashboardState()
 
@@ -68,11 +83,12 @@ def test_handle_chat_reports_missing_model():
 
     assert textbox == ""
     assert history == [
-        (
-            "Hello",
-            "Error: No model loaded. Load a model in Settings or start "
+        {"role": "user", "content": "Hello"},
+        {
+            "role": "assistant",
+            "content": "Error: No model loaded. Load a model in Settings or start "
             "with `selfllm dashboard --model-path ... --tokenizer-path ...`.",
-        )
+        },
     ]
 
 
@@ -93,7 +109,10 @@ def test_handle_chat_generates_assistant_reply():
     )
 
     assert textbox == ""
-    assert history == [("Say hello", "Hello from SelfLLM")]
+    assert history == [
+        {"role": "user", "content": "Say hello"},
+        {"role": "assistant", "content": "Hello from SelfLLM"},
+    ]
     assert tokenizer.last_prompt.endswith("User: Say hello\nAssistant:")
     assert model.last_kwargs["max_new_tokens"] == 12
     assert model.last_kwargs["temperature"] == 0.7

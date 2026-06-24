@@ -200,6 +200,29 @@ def _format_chat_prompt(
     return "\n".join(turns)
 
 
+def _messages_to_turns(
+    history: Optional[List[Dict[str, str]]],
+) -> List[Tuple[str, str]]:
+    """Convert Gradio messages into user/assistant prompt turns."""
+    turns: List[Tuple[str, str]] = []
+    pending_user: Optional[str] = None
+    for message in history or []:
+        role = message.get("role")
+        content = message.get("content", "")
+        if role == "user":
+            if pending_user is not None:
+                turns.append((pending_user, ""))
+            pending_user = content
+        elif role == "assistant":
+            if pending_user is None:
+                continue
+            turns.append((pending_user, content))
+            pending_user = None
+    if pending_user is not None:
+        turns.append((pending_user, ""))
+    return turns
+
+
 # --------------------------------------------------------------------------- #
 # Tab handlers
 # --------------------------------------------------------------------------- #
@@ -238,42 +261,43 @@ def _handle_generate(
         )
 
     generated_ids = output["sequences"][0].cpu().tolist()
-    full_text = state.tokenizer.decode(generated_ids)
+    prompt_len = prompt_ids.shape[1]
+    new_token_ids = generated_ids[prompt_len:]
 
-    # Strip the prompt from output
-    if full_text.startswith(prompt):
-        result = full_text[len(prompt) :].strip()
-    else:
-        result = full_text.strip()
-
-    return result
+    return state.tokenizer.decode(new_token_ids).strip()
 
 
 def _handle_chat(
     message: str,
-    history: Optional[List[Tuple[str, str]]],
+    history: Optional[List[Dict[str, str]]],
     system_prompt: str,
     temperature: float,
     top_p: float,
     max_tokens: int,
     repetition_penalty: float,
     state: DashboardState,
-) -> tuple[List[Tuple[str, str]], str]:
+) -> tuple[List[Dict[str, str]], str]:
     """Handle one chat turn in the Chat tab."""
     current_history = list(history or [])
-    if state.model is None or state.tokenizer is None:
-        current_history.append(
-            (
-                message,
-                "Error: No model loaded. Load a model in Settings or start "
-                "with `selfllm dashboard --model-path ... --tokenizer-path ...`.",
-            )
-        )
-        return current_history, ""
     if not message.strip():
         return current_history, ""
 
-    prompt = _format_chat_prompt(message, current_history, system_prompt)
+    if state.model is None or state.tokenizer is None:
+        current_history.append({"role": "user", "content": message})
+        current_history.append(
+            {
+                "role": "assistant",
+                "content": "Error: No model loaded. Load a model in Settings or start "
+                "with `selfllm dashboard --model-path ... --tokenizer-path ...`.",
+            }
+        )
+        return current_history, ""
+
+    prompt = _format_chat_prompt(
+        message,
+        _messages_to_turns(current_history),
+        system_prompt,
+    )
     response = _handle_generate(
         prompt=prompt,
         temperature=temperature,
@@ -283,10 +307,11 @@ def _handle_chat(
         repetition_penalty=repetition_penalty,
         state=state,
     )
+    current_history.append({"role": "user", "content": message})
     if response.startswith("Error:"):
-        current_history.append((message, response))
+        current_history.append({"role": "assistant", "content": response})
     else:
-        current_history.append((message, response.strip()))
+        current_history.append({"role": "assistant", "content": response.strip()})
     return current_history, ""
 
 
@@ -702,7 +727,7 @@ def create_dashboard(
                         ],
                         label="Iteration Log",
                     )
-                    si_plot = gr.LinePlot(
+                    _si_plot = gr.LinePlot(
                         x="Iteration",
                         y="Loss",
                         title="Loss Curve",
@@ -727,12 +752,12 @@ def create_dashboard(
                     outputs=si_status,
                 )
 
-                # Poll for table updates
-                demo.load(
+                # Poll for table updates.
+                si_timer = gr.Timer(value=2)
+                si_timer.tick(
                     fn=_get_iteration_table,
                     inputs=state,
                     outputs=si_table,
-                    every=2,
                 )
 
             # ==================== Training Tab ====================
@@ -785,12 +810,12 @@ def create_dashboard(
                     outputs=tr_status,
                 )
 
-                # Poll for plot updates
-                demo.load(
+                # Poll for plot updates.
+                tr_timer = gr.Timer(value=2)
+                tr_timer.tick(
                     fn=_get_training_plot_data,
                     inputs=state,
                     outputs=tr_plot,
-                    every=2,
                 )
 
             # ==================== Evaluation Tab ====================
