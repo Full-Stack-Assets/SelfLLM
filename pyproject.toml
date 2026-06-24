@@ -1,7 +1,7 @@
 # Vercel's Python builder runs `uv`, which requires a [project] table here.
 # Package builds for distribution are still handled by setup.py; this file
 # exists primarily to declare the Vercel deployment entrypoint and to give uv
-# a resolvable project + dependency set for the deployment environment.
+# a resolvable, slim dependency set for the serverless deployment environment.
 
 [project]
 name = "selfllm"
@@ -9,19 +9,20 @@ version = "0.1.0"
 description = "A recursively self-improving foundation language model"
 readme = "README.md"
 requires-python = ">=3.9"
-# Mirrors requirements.txt -- the dependency set the deployment installs.
+# Runtime dependencies needed to import and serve selfllm.serving.server:app.
+# Deliberately slim: the default CUDA torch build plus dev/UI extras (gradio,
+# pytest) blow past Vercel's serverless function size limit, so torch is pinned
+# to the CPU wheel (see [tool.uv.sources] below) and test/UI-only packages are
+# left out. The full set lives in requirements.txt / setup.py extras.
 dependencies = [
     "torch>=2.0.0",
     "numpy>=1.24.0",
-    "tqdm>=4.65.0",
-    "pyyaml>=6.0",
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0",
-    "httpx>=0.24.0",
-    "gradio>=4.0.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.65.0",
     "jinja2>=3.1.6",
-    "pytest>=7.0.0",
-    "pytest-cov>=4.0.0",
+    "httpx>=0.24.0",
 ]
 
 [tool.uv]
@@ -29,6 +30,16 @@ dependencies = [
 # resolve and install the dependencies above. The application code is imported
 # from the repository root, matching the prior requirements.txt-based build.
 package = false
+
+[tool.uv.sources]
+# Pull the CPU-only torch wheel instead of the default build, which bundles
+# multi-GB NVIDIA CUDA libraries and exceeds Vercel's function size limit.
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 # Vercel deployment configuration.
 #
