@@ -1,0 +1,12 @@
+# Project packaging is still driven by setup.py; intentionally no
+# [build-system] table here so the legacy setuptools backend keeps building
+# the package from setup.py.
+
+# Vercel deployment configuration.
+#
+# Tells the Vercel Python builder which ASGI application to serve. The
+# FastAPI `app` is defined in selfllm/serving/server.py (and re-exported from
+# selfllm/serving/__init__.py); point at the defining module directly so the
+# import chain stays minimal at cold start.
+[tool.vercel]
+entrypoint = "selfllm.serving.server:app"
