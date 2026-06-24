@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import urllib.request
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from selfllm.model.tokenizer import BPETokenizer
 from selfllm.training.dataset import SelfTrainingDataset
@@ -80,13 +80,79 @@ class DataPipeline:
         1083,
     ]
 
-    def __init__(self, tokenizer: BPETokenizer, max_seq_len: int = 512) -> None:
+    GUTENBERG_SEARCH_URL = (
+        "https://www.gutenberg.org/ebooks/search/"
+        "?sort_order=downloads&start_index={start_index}"
+    )
+
+    def __init__(self, tokenizer: Optional[BPETokenizer], max_seq_len: int = 512) -> None:
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
 
     # ------------------------------------------------------------------ #
     # Download
     # ------------------------------------------------------------------ #
+
+    @classmethod
+    def _text_urls_for_book(cls, book_id: int) -> List[str]:
+        """Return candidate plain-text URLs for a Gutenberg book."""
+        return [
+            f"https://www.gutenberg.org/files/{book_id}/{book_id}-0.txt",
+            f"https://www.gutenberg.org/files/{book_id}/{book_id}.txt",
+            f"https://www.gutenberg.org/cache/epub/{book_id}/pg{book_id}.txt",
+            f"https://www.gutenberg.org/cache/epub/{book_id}/pg{book_id}.txt.utf8",
+        ]
+
+    @classmethod
+    def _discover_gutenberg_book_ids(cls, target_count: int) -> List[int]:
+        """Discover popular Gutenberg IDs beyond the curated seed list."""
+        seen: Set[int] = set()
+        book_ids: List[int] = []
+        for book_id in cls.GUTENBERG_POPULAR:
+            if book_id not in seen:
+                seen.add(book_id)
+                book_ids.append(book_id)
+
+        start_index = 1
+        while len(book_ids) < target_count:
+            url = cls.GUTENBERG_SEARCH_URL.format(start_index=start_index)
+            before = len(book_ids)
+            try:
+                with urllib.request.urlopen(url, timeout=20) as resp:
+                    html = resp.read().decode("utf-8", errors="ignore")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to discover Gutenberg IDs from %s: %s", url, exc)
+                break
+
+            for raw_id in re.findall(r'href="/ebooks/(\d+)"', html):
+                book_id = int(raw_id)
+                if book_id not in seen:
+                    seen.add(book_id)
+                    book_ids.append(book_id)
+                    if len(book_ids) >= target_count:
+                        break
+
+            if len(book_ids) == before:
+                break
+            start_index += 25
+
+        return book_ids[:target_count]
+
+    @classmethod
+    def _download_book(cls, book_id: int, path: str) -> bool:
+        """Download one Gutenberg book to *path* using text URL fallbacks."""
+        for url in cls._text_urls_for_book(book_id):
+            try:
+                with urllib.request.urlopen(url, timeout=30) as resp:
+                    data = resp.read()
+                if not data.strip():
+                    continue
+                with open(path, "wb") as fh:
+                    fh.write(data)
+                return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
 
     def download_gutenberg_books(
         self,
@@ -103,24 +169,31 @@ class DataPipeline:
         Returns:
             List of file paths to downloaded books.
         """
+        if num_books <= 0:
+            raise ValueError("num_books must be positive")
+
         os.makedirs(output_dir, exist_ok=True)
         downloaded: List[str] = []
 
-        for book_id in self.GUTENBERG_POPULAR[:num_books]:
-            url = f"https://www.gutenberg.org/files/{book_id}/{book_id}-0.txt"
+        book_ids = self._discover_gutenberg_book_ids(num_books)
+        for book_id in book_ids:
             path = os.path.join(output_dir, f"{book_id}.txt")
 
             if os.path.exists(path):
                 downloaded.append(path)
                 continue
 
-            try:
-                urllib.request.urlretrieve(url, path)
+            if self._download_book(book_id, path):
                 downloaded.append(path)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to download %s: %s", book_id, exc)
+            else:
+                logger.warning("Failed to download Gutenberg book %s", book_id)
 
-        logger.info("Downloaded %d books to %s", len(downloaded), output_dir)
+        logger.info(
+            "Downloaded %d/%d requested books to %s",
+            len(downloaded),
+            num_books,
+            output_dir,
+        )
         return downloaded
 
     # ------------------------------------------------------------------ #
@@ -171,6 +244,9 @@ class DataPipeline:
         Returns:
             List of text chunks.
         """
+        if self.tokenizer is None:
+            raise ValueError("A tokenizer is required before chunking text")
+
         tokens = self.tokenizer.encode(text)
         chunks: List[str] = []
 
@@ -195,7 +271,7 @@ class DataPipeline:
         self,
         corpus_dir: str,
         output_path: str = "./data/training_dataset.pt",
-        max_chunks: int = 100000,
+        max_chunks: Optional[int] = None,
     ) -> SelfTrainingDataset:
         """
         Process all text files in *corpus_dir* into a training dataset.
@@ -207,11 +283,16 @@ class DataPipeline:
         Args:
             corpus_dir: Root directory containing ``.txt`` files.
             output_path: Path where the serialized dataset is written.
-            max_chunks: Maximum number of chunks to collect.
+            max_chunks: Maximum number of chunks to collect. ``None`` means all chunks.
 
         Returns:
             A ``SelfTrainingDataset`` instance built from the corpus.
         """
+        if self.tokenizer is None:
+            raise ValueError("A tokenizer is required before creating a dataset")
+        if max_chunks is not None and max_chunks <= 0:
+            max_chunks = None
+
         text_files = glob.glob(
             os.path.join(corpus_dir, "**/*.txt"), recursive=True
         )
@@ -241,7 +322,8 @@ class DataPipeline:
                         }
                     )
 
-                if len(all_samples) >= max_chunks:
+                if max_chunks is not None and len(all_samples) >= max_chunks:
+                    all_samples = all_samples[:max_chunks]
                     break
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Error processing %s: %s", filepath, exc)
@@ -268,7 +350,7 @@ class DataPipeline:
         self,
         corpus_dir: str,
         vocab_size: int = 32000,
-        sample_size: int = 1000000,
+        sample_size: Optional[int] = None,
     ) -> BPETokenizer:
         """
         Train a new BPE tokenizer on the corpus.
@@ -276,11 +358,14 @@ class DataPipeline:
         Args:
             corpus_dir: Root directory containing ``.txt`` files.
             vocab_size: Target vocabulary size.
-            sample_size: Approximate total character budget to read.
+            sample_size: Approximate total character budget to read. ``None`` means all text.
 
         Returns:
             A freshly trained ``BPETokenizer``.
         """
+        if sample_size is not None and sample_size <= 0:
+            sample_size = None
+
         text_files = glob.glob(
             os.path.join(corpus_dir, "**/*.txt"), recursive=True
         )
@@ -296,7 +381,7 @@ class DataPipeline:
             text = self.preprocess_text(text)
             sample_texts.append(text)
             total_chars += len(text)
-            if total_chars >= sample_size:
+            if sample_size is not None and total_chars >= sample_size:
                 break
 
         logger.info(

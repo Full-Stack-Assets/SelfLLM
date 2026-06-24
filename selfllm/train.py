@@ -123,6 +123,10 @@ def merge_config(yaml_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dict
         real_cfg["output_dir"] = cli_args.output_dir
     if getattr(cli_args, "num_books", None) is not None:
         real_cfg["num_books"] = cli_args.num_books
+    if getattr(cli_args, "tokenizer_sample_size", None) is not None:
+        real_cfg["tokenizer_sample_size"] = cli_args.tokenizer_sample_size
+    if getattr(cli_args, "max_chunks", None) is not None:
+        real_cfg["max_chunks"] = cli_args.max_chunks
     if getattr(cli_args, "pretrain_epochs", None) is not None:
         real_cfg["pretrain_epochs"] = cli_args.pretrain_epochs
     if getattr(cli_args, "pretrain_batch_size", None) is not None:
@@ -323,6 +327,14 @@ def build_parser() -> argparse.ArgumentParser:
     real_train_parser.add_argument(
         "--num-books", type=int, default=100,
         help="Number of Gutenberg books to download (default: 100).",
+    )
+    real_train_parser.add_argument(
+        "--tokenizer-sample-size", type=int, default=0,
+        help="Tokenizer character budget; 0 uses the full downloaded corpus (default: 0).",
+    )
+    real_train_parser.add_argument(
+        "--max-chunks", type=int, default=0,
+        help="Maximum training chunks; 0 uses all chunks (default: 0).",
     )
     real_train_parser.add_argument(
         "--pretrain-epochs", type=int, default=3,
@@ -889,6 +901,10 @@ def cmd_real_training(cfg: Dict[str, Any], logger: Logger) -> None:
     data_dir = real_cfg.get("data_dir", cfg.get("data_dir", "./data"))
     output_dir = real_cfg.get("output_dir", cfg.get("output_dir", "./real_model"))
     num_books = real_cfg.get("num_books", cfg.get("num_books", 100))
+    tokenizer_sample_size = real_cfg.get(
+        "tokenizer_sample_size", cfg.get("tokenizer_sample_size", 0)
+    )
+    max_chunks = real_cfg.get("max_chunks", cfg.get("max_chunks", 0))
     pretrain_epochs = real_cfg.get("pretrain_epochs", cfg.get("pretrain_epochs", 3))
     pretrain_batch_size = real_cfg.get("pretrain_batch_size", cfg.get("pretrain_batch_size", 8))
     pretrain_lr = real_cfg.get("pretrain_lr", cfg.get("pretrain_lr", 1e-3))
@@ -909,6 +925,10 @@ def cmd_real_training(cfg: Dict[str, Any], logger: Logger) -> None:
         data_dir=data_dir,
         output_dir=output_dir,
         num_books=num_books,
+        tokenizer_sample_size=(
+            tokenizer_sample_size if tokenizer_sample_size > 0 else None
+        ),
+        max_chunks=max_chunks if max_chunks > 0 else None,
         pretrain_epochs=pretrain_epochs,
         pretrain_batch_size=pretrain_batch_size,
         pretrain_lr=pretrain_lr,

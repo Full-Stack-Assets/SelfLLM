@@ -106,6 +106,8 @@ def train_real_model(
     data_dir: str = "./data",
     output_dir: str = "./real_model",
     num_books: int = 100,
+    tokenizer_sample_size: Optional[int] = None,
+    max_chunks: Optional[int] = None,
     pretrain_epochs: int = 3,
     pretrain_batch_size: int = 8,
     pretrain_lr: float = 1e-3,
@@ -124,6 +126,8 @@ def train_real_model(
         data_dir: Directory for downloaded data.
         output_dir: Directory for saved models.
         num_books: Number of Gutenberg books to download.
+        tokenizer_sample_size: Character budget for tokenizer training. ``None`` uses all text.
+        max_chunks: Maximum dataset chunks to keep. ``None`` uses every chunk.
         pretrain_epochs: Pre-training epochs.
         pretrain_batch_size: Training batch size.
         pretrain_lr: Learning rate for pre-training.
@@ -182,6 +186,7 @@ def train_real_model(
     tokenizer = pipeline.train_tokenizer_on_corpus(
         corpus_dir=os.path.join(data_dir, "books"),
         vocab_size=config.vocab_size,
+        sample_size=tokenizer_sample_size,
     )
     tokenizer_path = os.path.join(output_dir, "tokenizer.json")
     tokenizer.save(tokenizer_path)
@@ -195,6 +200,7 @@ def train_real_model(
     dataset = pipeline.create_training_dataset(
         corpus_dir=os.path.join(data_dir, "books"),
         output_path=os.path.join(data_dir, "train_dataset.pt"),
+        max_chunks=max_chunks,
     )
     print(f"  Dataset: {len(dataset)} samples")
 
@@ -410,6 +416,18 @@ Examples:
         help="Number of Gutenberg books to download (default: 100)",
     )
     parser.add_argument(
+        "--tokenizer-sample-size",
+        type=int,
+        default=0,
+        help="Tokenizer character budget; 0 uses the full downloaded corpus (default: 0)",
+    )
+    parser.add_argument(
+        "--max-chunks",
+        type=int,
+        default=0,
+        help="Maximum training chunks; 0 uses all chunks (default: 0)",
+    )
+    parser.add_argument(
         "--pretrain-epochs",
         type=int,
         default=3,
@@ -488,6 +506,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         data_dir=args.data_dir,
         output_dir=args.output_dir,
         num_books=args.num_books,
+        tokenizer_sample_size=(
+            args.tokenizer_sample_size if args.tokenizer_sample_size > 0 else None
+        ),
+        max_chunks=args.max_chunks if args.max_chunks > 0 else None,
         pretrain_epochs=args.pretrain_epochs,
         pretrain_batch_size=args.pretrain_batch_size,
         pretrain_lr=args.pretrain_lr,
