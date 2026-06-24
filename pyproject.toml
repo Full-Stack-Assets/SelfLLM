@@ -25,6 +25,20 @@ dependencies = [
     "httpx>=0.24.0",
 ]
 
+# Optional groups, mirroring setup.py's extras. These are NOT bundled into the
+# Vercel deployment (uv installs only the default dependencies above); they
+# exist so `pip install -e ".[dev]"` in CI restores the full dependency set --
+# notably gradio, which the dashboard module (and tests/test_dashboard.py)
+# imports at module load.
+[project.optional-dependencies]
+dashboard = ["gradio>=4.0.0"]
+rag = ["faiss-cpu>=1.7.0"]
+dev = [
+    "gradio>=4.0.0",
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
 [tool.uv]
 # Don't try to build/install the selfllm package itself; uv only needs to
 # resolve and install the dependencies above. The application code is imported
