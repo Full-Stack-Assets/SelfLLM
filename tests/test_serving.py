@@ -442,6 +442,29 @@ class TestServerEndpoints:
             assert data["status"] == "healthy"
             assert data["model_loaded"] is False
 
+    def test_root_redirects_to_chat(self):
+        """/ redirects to the browser chat UI."""
+        from fastapi.testclient import TestClient
+        from selfllm.serving.server import app
+
+        with TestClient(app) as client:
+            response = client.get("/", follow_redirects=False)
+            assert response.status_code in (302, 307)
+            assert response.headers["location"] == "/chat"
+
+    def test_chat_ui_endpoint(self):
+        """/chat returns an HTML page with the chat client."""
+        from fastapi.testclient import TestClient
+        from selfllm.serving.server import app
+
+        with TestClient(app) as client:
+            response = client.get("/chat")
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("text/html")
+            body = response.text
+            assert "SelfLLM Web Chat" in body
+            assert "/v1/chat/completions" in body
+
     def test_health_endpoint_with_model(self, mock_model, monkeypatch):
         """/health returns loaded when model is set."""
         from fastapi.testclient import TestClient
@@ -672,6 +695,17 @@ class TestServerEndpoints:
                 "/v1/chat/completions",
                 json={"model": "selfllm", "messages": [{"role": "user", "content": "hi"}]},
             ).status_code == 503
+
+    def test_chat_ui_remains_public_with_api_key(self, monkeypatch):
+        """/chat remains reachable without auth even when /v1 endpoints are locked."""
+        from fastapi.testclient import TestClient
+        import selfllm.serving.server as server_module
+
+        monkeypatch.setattr(server_module, "_api_key", "secret-key")
+        with TestClient(server_module.app) as client:
+            response = client.get("/chat")
+            assert response.status_code == 200
+            assert "SelfLLM Web Chat" in response.text
 
     def test_chat_completions_reasoning_knob(self, monkeypatch):
         """/v1/chat/completions with a `reasoning` option runs a strategy."""

@@ -6,6 +6,7 @@ Provides FastAPI endpoints implementing the OpenAI API protocol:
     GET  /v1/models             -- List available models
     GET  /health                -- Health check
     GET  /v1/stats              -- Serving statistics
+    GET  /chat                  -- Browser chat UI
 
 The server integrates with PagedAttention KV cache and continuous batching
 for efficient concurrent request handling.
@@ -23,7 +24,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import torch
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,310 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="SelfLLM API", version="2.0.0", lifespan=lifespan)
+
+_CHAT_UI_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SelfLLM Web Chat</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f172a;
+      --panel: #111827;
+      --panel-2: #1f2937;
+      --border: #334155;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --accent: #22c55e;
+      --accent-hover: #16a34a;
+      --error: #f43f5e;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: linear-gradient(180deg, #0b1224, var(--bg));
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      padding: 24px;
+    }
+    .app {
+      width: min(980px, 100%);
+      display: grid;
+      gap: 16px;
+      grid-template-columns: 280px 1fr;
+    }
+    .panel {
+      background: rgba(17, 24, 39, 0.92);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px;
+      backdrop-filter: blur(4px);
+    }
+    .settings { display: grid; gap: 10px; align-content: start; }
+    label {
+      font-size: 12px;
+      color: var(--muted);
+      display: grid;
+      gap: 6px;
+    }
+    input, textarea, button {
+      font: inherit;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 12px;
+    }
+    input:focus, textarea:focus {
+      outline: 2px solid #2563eb;
+      outline-offset: 0;
+    }
+    button {
+      cursor: pointer;
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #06250f;
+      font-weight: 600;
+    }
+    button:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+    button:disabled { opacity: 0.65; cursor: not-allowed; }
+    .secondary {
+      background: transparent;
+      color: var(--text);
+      border-color: var(--border);
+    }
+    .chat {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 10px;
+      min-height: 72vh;
+    }
+    h1 { margin: 0; font-size: 18px; }
+    .subtitle { margin: 0; color: var(--muted); font-size: 13px; }
+    .messages {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+      overflow-y: auto;
+      background: rgba(15, 23, 42, 0.55);
+      display: grid;
+      gap: 10px;
+      align-content: start;
+    }
+    .message {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+    .user { background: rgba(37, 99, 235, 0.13); }
+    .assistant { background: rgba(20, 83, 45, 0.22); }
+    .message b {
+      display: block;
+      margin-bottom: 6px;
+      color: #cbd5e1;
+      font-size: 12px;
+      letter-spacing: 0.02em;
+    }
+    .controls {
+      display: grid;
+      gap: 8px;
+    }
+    .controls-row {
+      display: flex;
+      gap: 8px;
+    }
+    .controls-row button { min-width: 120px; }
+    .status {
+      min-height: 20px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .status.error { color: var(--error); }
+    @media (max-width: 900px) {
+      .app { grid-template-columns: 1fr; }
+      .chat { min-height: 70vh; }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <section class="panel settings">
+      <h1>SelfLLM Web Chat</h1>
+      <p class="subtitle">Talk to the currently loaded local model via <code>/v1/chat/completions</code>.</p>
+
+      <label>Model
+        <input id="model" value="selfllm" />
+      </label>
+      <label>Max tokens
+        <input id="maxTokens" type="number" min="1" max="4096" value="256" />
+      </label>
+      <label>Temperature
+        <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.8" />
+      </label>
+      <label>Top-p
+        <input id="topP" type="number" min="0" max="1" step="0.05" value="0.95" />
+      </label>
+      <label>API key (optional)
+        <input id="apiKey" type="password" placeholder="Used as Bearer token for protected servers" />
+      </label>
+      <button id="clearBtn" class="secondary" type="button">Clear conversation</button>
+    </section>
+
+    <section class="panel chat">
+      <div>
+        <h1>Chat</h1>
+        <p class="subtitle">Press Enter to send, Shift+Enter for newline.</p>
+      </div>
+      <div id="messages" class="messages"></div>
+      <div class="controls">
+        <textarea id="prompt" rows="5" placeholder="Type your message..."></textarea>
+        <div class="controls-row">
+          <button id="sendBtn" type="button">Send</button>
+        </div>
+        <div id="status" class="status"></div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const messagesEl = document.getElementById("messages");
+    const promptEl = document.getElementById("prompt");
+    const sendBtn = document.getElementById("sendBtn");
+    const clearBtn = document.getElementById("clearBtn");
+    const statusEl = document.getElementById("status");
+    const modelEl = document.getElementById("model");
+    const maxTokensEl = document.getElementById("maxTokens");
+    const temperatureEl = document.getElementById("temperature");
+    const topPEl = document.getElementById("topP");
+    const apiKeyEl = document.getElementById("apiKey");
+
+    let history = [];
+    let busy = false;
+
+    function setStatus(message, isError = false) {
+      statusEl.textContent = message || "";
+      statusEl.className = isError ? "status error" : "status";
+    }
+
+    function appendMessage(role, content) {
+      const node = document.createElement("article");
+      node.className = `message ${role}`;
+      const title = document.createElement("b");
+      title.textContent = role === "user" ? "User" : "Assistant";
+      const text = document.createElement("div");
+      text.textContent = content;
+      node.appendChild(title);
+      node.appendChild(text);
+      messagesEl.appendChild(node);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function renderWelcome() {
+      messagesEl.innerHTML = "";
+      appendMessage("assistant", "Hello. I am your local SelfLLM model. Ask me anything.");
+    }
+
+    async function sendMessage() {
+      if (busy) return;
+      const text = promptEl.value.trim();
+      if (!text) return;
+
+      const payload = {
+        model: modelEl.value.trim() || "selfllm",
+        messages: [...history, { role: "user", content: text }],
+        max_tokens: Number(maxTokensEl.value) || 256,
+        temperature: Number(temperatureEl.value),
+        top_p: Number(topPEl.value),
+      };
+
+      const headers = { "Content-Type": "application/json" };
+      const apiKey = apiKeyEl.value.trim();
+      if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+
+      busy = true;
+      sendBtn.disabled = true;
+      promptEl.disabled = true;
+      appendMessage("user", text);
+      setStatus("Generating response...");
+
+      try {
+        const response = await fetch("/v1/chat/completions", {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload),
+        });
+
+        if (!response.ok) {
+          let detail = `${response.status} ${response.statusText}`;
+          try {
+            const err = await response.json();
+            if (err && err.detail) detail = String(err.detail);
+          } catch (_e) {
+            // No JSON body; keep default detail.
+          }
+          throw new Error(detail);
+        }
+
+        const data = await response.json();
+        const assistantText = data.choices?.[0]?.message?.content ?? "";
+        appendMessage("assistant", assistantText || "(empty response)");
+
+        history.push({ role: "user", content: text });
+        history.push({ role: "assistant", content: assistantText });
+        promptEl.value = "";
+        setStatus("Done.");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setStatus(`Request failed: ${message}`, true);
+      } finally {
+        busy = false;
+        sendBtn.disabled = false;
+        promptEl.disabled = false;
+        promptEl.focus();
+      }
+    }
+
+    clearBtn.addEventListener("click", () => {
+      history = [];
+      promptEl.value = "";
+      setStatus("");
+      renderWelcome();
+      promptEl.focus();
+    });
+
+    sendBtn.addEventListener("click", sendMessage);
+    promptEl.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        sendMessage();
+      }
+    });
+
+    renderWelcome();
+    promptEl.focus();
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/", include_in_schema=False)
+async def root():
+    """Redirect the root URL to the browser chat UI."""
+    return RedirectResponse(url="/chat")
+
+
+@app.get("/chat", response_class=HTMLResponse)
+async def chat_ui():
+    """Serve a minimal in-browser chat UI for the local model."""
+    return HTMLResponse(_CHAT_UI_HTML)
 
 
 async def _check_api_key(authorization: Optional[str] = Header(None)) -> None:
