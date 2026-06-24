@@ -160,6 +160,73 @@ With extra whitespace.
         for chunk in chunks:
             assert len(chunk.strip()) > 0
 
+    def test_discover_gutenberg_ids_extends_curated_list(self, monkeypatch):
+        """Discovery fills requests larger than the curated seed list."""
+        from selfllm.data.pipeline import DataPipeline
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b'<a href="/ebooks/3">A</a><a href="/ebooks/4">B</a>'
+
+        monkeypatch.setattr(DataPipeline, "GUTENBERG_POPULAR", [1, 2])
+        monkeypatch.setattr(
+            "urllib.request.urlopen", lambda *args, **kwargs: FakeResponse()
+        )
+
+        assert DataPipeline._discover_gutenberg_book_ids(4) == [1, 2, 3, 4]
+
+    def test_download_uses_discovered_ids_beyond_curated_list(self, monkeypatch, tmp_path):
+        """download_gutenberg_books is no longer capped by GUTENBERG_POPULAR."""
+        from selfllm.data.pipeline import DataPipeline
+
+        monkeypatch.setattr(
+            DataPipeline,
+            "_discover_gutenberg_book_ids",
+            classmethod(lambda cls, target_count: [1, 2, 3, 4][:target_count]),
+        )
+
+        def fake_download(cls, book_id, path):
+            Path(path).write_text(f"book {book_id}", encoding="utf-8")
+            return True
+
+        monkeypatch.setattr(DataPipeline, "_download_book", classmethod(fake_download))
+
+        paths = DataPipeline(tokenizer=None).download_gutenberg_books(
+            output_dir=str(tmp_path), num_books=4
+        )
+
+        assert [Path(path).stem for path in paths] == ["1", "2", "3", "4"]
+
+    def test_train_tokenizer_uses_full_corpus_when_sample_size_is_none(
+        self, monkeypatch, tmp_path
+    ):
+        """Tokenizer training can consume every downloaded text file."""
+        from selfllm.data.pipeline import DataPipeline
+        from selfllm.model.tokenizer import BPETokenizer
+
+        (tmp_path / "a.txt").write_text("alpha " * 20, encoding="utf-8")
+        (tmp_path / "b.txt").write_text("beta " * 20, encoding="utf-8")
+        seen_texts = []
+
+        def fake_train(self, texts):
+            seen_texts.extend(texts)
+
+        monkeypatch.setattr(BPETokenizer, "train", fake_train)
+
+        DataPipeline(tokenizer=None).train_tokenizer_on_corpus(
+            corpus_dir=str(tmp_path), vocab_size=128, sample_size=None
+        )
+
+        assert len(seen_texts) == 2
+        assert any("alpha" in text for text in seen_texts)
+        assert any("beta" in text for text in seen_texts)
+
 
 # --------------------------------------------------------------------------- #
 # Training pipeline test (mocked)
@@ -344,6 +411,8 @@ class TestCLIArguments:
 
         assert args.scale == "small"
         assert args.num_books == 100
+        assert args.tokenizer_sample_size == 0
+        assert args.max_chunks == 0
         assert args.pretrain_epochs == 3
         assert args.pretrain_batch_size == 8
         assert args.pretrain_lr == 1e-3
@@ -361,6 +430,8 @@ class TestCLIArguments:
         args = parser.parse_args([
             "--scale", "full",
             "--num-books", "1000",
+            "--tokenizer-sample-size", "5000000",
+            "--max-chunks", "250000",
             "--pretrain-epochs", "5",
             "--self-improve-iterations", "10",
             "--lora-rank", "16",
@@ -371,6 +442,8 @@ class TestCLIArguments:
 
         assert args.scale == "full"
         assert args.num_books == 1000
+        assert args.tokenizer_sample_size == 5000000
+        assert args.max_chunks == 250000
         assert args.pretrain_epochs == 5
         assert args.self_improve_iterations == 10
         assert args.lora_rank == 16

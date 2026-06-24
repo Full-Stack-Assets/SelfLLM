@@ -221,6 +221,7 @@ If an iteration degrades performance, the system automatically reverts to the pr
 | `selfllm init` | Create model + tokenizer | `--vocab-size`, `--d-model`, `--n-layers` |
 | `selfllm pretrain` | Pre-train on corpus | `--data-path`, `--num-epochs`, `--batch-size` |
 | `selfllm self-improve` | Recursive improvement loop | `--max-iterations`, `--use-lora`, `--use-dpo` |
+| `selfllm real-training` | Download corpus + train end to end | `--num-books`, `--tokenizer-sample-size`, `--max-chunks` |
 | `selfllm generate` | Interactive text generation | `--prompt`, `--temperature`, `--top-p` |
 | `selfllm evaluate` | Run evaluation suite | `--eval-data`, `--output-path` |
 | `selfllm dashboard` | Launch web UI | `--port`, `--share` |

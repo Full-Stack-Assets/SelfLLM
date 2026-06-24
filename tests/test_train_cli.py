@@ -119,6 +119,12 @@ def test_real_training_lora_flag_passthrough():
     assert merged["real_training"]["lora_rank"] == 16
 
 
+def test_real_training_data_limit_flags_passthrough():
+    merged = cli.merge_config({}, _ns(tokenizer_sample_size=5_000_000, max_chunks=250_000))
+    assert merged["real_training"]["tokenizer_sample_size"] == 5_000_000
+    assert merged["real_training"]["max_chunks"] == 250_000
+
+
 # ---------------------------------------------------------------------------
 # build_parser
 # ---------------------------------------------------------------------------
@@ -170,6 +176,8 @@ def test_real_training_defaults():
     assert args.use_lora is True
     assert args.use_dpo is True
     assert args.num_books == 100
+    assert args.tokenizer_sample_size == 0
+    assert args.max_chunks == 0
 
 
 def test_no_lora_and_no_dpo_toggles():
