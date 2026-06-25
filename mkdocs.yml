@@ -34,6 +34,7 @@ nav:
   - Home: index.md
   - Guides:
       - Custom Provider: CUSTOM_PROVIDER.md
+      - Vertex AI Tuning: VERTEX_AI.md
   - Specifications:
       - SPEC v4: SPEC-v4.md
       - SPEC v3: SPEC-v3.md

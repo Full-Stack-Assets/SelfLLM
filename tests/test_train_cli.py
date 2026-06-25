@@ -162,7 +162,19 @@ def test_global_config_flag_parsed_before_subcommand():
     assert args.command == "init"
 
 
-@pytest.mark.parametrize("cmd", ["pretrain", "self-improve", "generate", "evaluate", "serve", "ppo"])
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "pretrain",
+        "self-improve",
+        "generate",
+        "evaluate",
+        "serve",
+        "ppo",
+        "vertex-export",
+        "vertex-tune-plan",
+    ],
+)
 def test_required_args_missing_exits(cmd):
     """Each of these subcommands has at least one required flag; omitting it
     must cause argparse to exit (rather than silently proceed)."""
@@ -184,6 +196,40 @@ def test_no_lora_and_no_dpo_toggles():
     args = cli.build_parser().parse_args(["real-training", "--no-lora", "--no-dpo"])
     assert args.use_lora is False
     assert args.use_dpo is False
+
+
+def test_vertex_export_parser_dest_names():
+    args = cli.build_parser().parse_args([
+        "vertex-export",
+        "--input-path", "samples.json",
+        "--train-output-path", "train.jsonl",
+        "--validation-output-path", "val.jsonl",
+        "--validation-ratio", "0.2",
+        "--system-instruction", "Be concise.",
+    ])
+    assert args.command == "vertex-export"
+    assert args.input_path == "samples.json"
+    assert args.train_output_path == "train.jsonl"
+    assert args.validation_output_path == "val.jsonl"
+    assert args.validation_ratio == 0.2
+    assert args.system_instruction == "Be concise."
+
+
+def test_vertex_tune_plan_parser_dest_names():
+    args = cli.build_parser().parse_args([
+        "vertex-tune-plan",
+        "--project-id", "my-project",
+        "--training-dataset-uri", "gs://bucket/train.jsonl",
+        "--adapter-size", "8",
+        "--plan-output-path", "plan.json",
+    ])
+    assert args.command == "vertex-tune-plan"
+    assert args.project_id == "my-project"
+    assert args.location == "us-central1"
+    assert args.base_model == "gemini-2.5-flash"
+    assert args.training_dataset_uri == "gs://bucket/train.jsonl"
+    assert args.adapter_size == 8
+    assert args.plan_output_path == "plan.json"
 
 
 def test_serve_defaults():
