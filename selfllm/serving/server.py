@@ -332,7 +332,7 @@ _CHAT_UI_HTML = """<!doctype html>
     function normalizeBaseUrl(rawValue) {
       const trimmed = String(rawValue || "").trim();
       const fallback = window.location.origin;
-      return (trimmed || fallback).replace(/\/+$/, "");
+      return (trimmed || fallback).replace(/\\/+$/, "");
     }
 
     function currentChatEndpoint() {
