@@ -463,6 +463,9 @@ class TestServerEndpoints:
             assert response.headers["content-type"].startswith("text/html")
             body = response.text
             assert "SelfLLM Web Chat" in body
+            assert "id=\"apiBaseUrl\"" in body
+            assert "window.location.search" in body
+            assert "selfllm_api_base_url" in body
             assert "/v1/chat/completions" in body
 
     def test_health_endpoint_with_model(self, mock_model, monkeypatch):

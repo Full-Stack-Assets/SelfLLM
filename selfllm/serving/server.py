@@ -251,8 +251,11 @@ _CHAT_UI_HTML = """<!doctype html>
   <main class="app">
     <section class="panel settings">
       <h1>SelfLLM Web Chat</h1>
-      <p class="subtitle">Talk to the currently loaded local model via <code>/v1/chat/completions</code>.</p>
+      <p class="subtitle">Talk to a SelfLLM-compatible endpoint from your browser.</p>
 
+      <label>API base URL
+        <input id="apiBaseUrl" value="" placeholder="https://your-server.example.com" />
+      </label>
       <label>Model
         <input id="model" value="selfllm" />
       </label>
@@ -293,6 +296,7 @@ _CHAT_UI_HTML = """<!doctype html>
     const sendBtn = document.getElementById("sendBtn");
     const clearBtn = document.getElementById("clearBtn");
     const statusEl = document.getElementById("status");
+    const apiBaseUrlEl = document.getElementById("apiBaseUrl");
     const modelEl = document.getElementById("model");
     const maxTokensEl = document.getElementById("maxTokens");
     const temperatureEl = document.getElementById("temperature");
@@ -322,7 +326,26 @@ _CHAT_UI_HTML = """<!doctype html>
 
     function renderWelcome() {
       messagesEl.innerHTML = "";
-      appendMessage("assistant", "Hello. I am your local SelfLLM model. Ask me anything.");
+      appendMessage("assistant", "Hello. I am your SelfLLM assistant. Ask me anything.");
+    }
+
+    function normalizeBaseUrl(rawValue) {
+      const trimmed = String(rawValue || "").trim();
+      const fallback = window.location.origin;
+      return (trimmed || fallback).replace(/\/+$/, "");
+    }
+
+    function currentChatEndpoint() {
+      return `${normalizeBaseUrl(apiBaseUrlEl.value)}/v1/chat/completions`;
+    }
+
+    function initializeApiBaseUrl() {
+      const qs = new URLSearchParams(window.location.search);
+      const fromQuery = qs.get("endpoint");
+      const fromStorage = window.localStorage.getItem("selfllm_api_base_url");
+      const initial = normalizeBaseUrl(fromQuery || fromStorage || window.location.origin);
+      apiBaseUrlEl.value = initial;
+      window.localStorage.setItem("selfllm_api_base_url", initial);
     }
 
     async function sendMessage() {
@@ -341,15 +364,18 @@ _CHAT_UI_HTML = """<!doctype html>
       const headers = { "Content-Type": "application/json" };
       const apiKey = apiKeyEl.value.trim();
       if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+      const chatEndpoint = currentChatEndpoint();
+      window.localStorage.setItem("selfllm_api_base_url", normalizeBaseUrl(apiBaseUrlEl.value));
 
       busy = true;
       sendBtn.disabled = true;
       promptEl.disabled = true;
+      apiBaseUrlEl.disabled = true;
       appendMessage("user", text);
-      setStatus("Generating response...");
+      setStatus(`Generating response from ${chatEndpoint} ...`);
 
       try {
-        const response = await fetch("/v1/chat/completions", {
+        const response = await fetch(chatEndpoint, {
           method: "POST",
           headers,
           body: JSON.stringify(payload),
@@ -376,11 +402,12 @@ _CHAT_UI_HTML = """<!doctype html>
         setStatus("Done.");
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        setStatus(`Request failed: ${message}`, true);
+        setStatus(`Request failed: ${message} (check endpoint URL and CORS policy)`, true);
       } finally {
         busy = false;
         sendBtn.disabled = false;
         promptEl.disabled = false;
+        apiBaseUrlEl.disabled = false;
         promptEl.focus();
       }
     }
@@ -394,6 +421,12 @@ _CHAT_UI_HTML = """<!doctype html>
     });
 
     sendBtn.addEventListener("click", sendMessage);
+    apiBaseUrlEl.addEventListener("change", () => {
+      const normalized = normalizeBaseUrl(apiBaseUrlEl.value);
+      apiBaseUrlEl.value = normalized;
+      window.localStorage.setItem("selfllm_api_base_url", normalized);
+      setStatus(`Endpoint set to ${normalized}`);
+    });
     promptEl.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();
@@ -401,6 +434,7 @@ _CHAT_UI_HTML = """<!doctype html>
       }
     });
 
+    initializeApiBaseUrl();
     renderWelcome();
     promptEl.focus();
   </script>
