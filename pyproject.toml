@@ -1,0 +1,64 @@
+# Vercel's Python builder runs `uv`, which requires a [project] table here.
+# Package builds for distribution are still handled by setup.py; this file
+# exists primarily to declare the Vercel deployment entrypoint and to give uv
+# a resolvable, slim dependency set for the serverless deployment environment.
+
+[project]
+name = "selfllm"
+version = "0.1.0"
+description = "A recursively self-improving foundation language model"
+readme = "README.md"
+requires-python = ">=3.9"
+# Runtime dependencies needed to import and serve selfllm.serving.server:app.
+# Deliberately slim: the default CUDA torch build plus dev/UI extras (gradio,
+# pytest) blow past Vercel's serverless function size limit, so torch is pinned
+# to the CPU wheel (see [tool.uv.sources] below) and test/UI-only packages are
+# left out. The full set lives in requirements.txt / setup.py extras.
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.65.0",
+    "jinja2>=3.1.6",
+    "httpx>=0.24.0",
+]
+
+# Optional groups, mirroring setup.py's extras. These are NOT bundled into the
+# Vercel deployment (uv installs only the default dependencies above); they
+# exist so `pip install -e ".[dev]"` in CI restores the full dependency set --
+# notably gradio, which the dashboard module (and tests/test_dashboard.py)
+# imports at module load.
+[project.optional-dependencies]
+dashboard = ["gradio>=4.0.0"]
+rag = ["faiss-cpu>=1.7.0"]
+dev = [
+    "gradio>=4.0.0",
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[tool.uv]
+# Don't try to build/install the selfllm package itself; uv only needs to
+# resolve and install the dependencies above. The application code is imported
+# from the repository root, matching the prior requirements.txt-based build.
+package = false
+
+[tool.uv.sources]
+# Pull the CPU-only torch wheel instead of the default build, which bundles
+# multi-GB NVIDIA CUDA libraries and exceeds Vercel's function size limit.
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+# Vercel deployment configuration.
+#
+# Tells the Vercel Python builder which ASGI application to serve. The FastAPI
+# `app` is defined in selfllm/serving/server.py (and re-exported from
+# selfllm/serving/__init__.py); point at the defining module directly.
+[tool.vercel]
+entrypoint = "selfllm.serving.server:app"
