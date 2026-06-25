@@ -223,6 +223,80 @@ def _messages_to_turns(
     return turns
 
 
+def _generate_text(
+    prompt: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    top_k: int,
+    repetition_penalty: float,
+    state: DashboardState,
+) -> tuple[str, Dict[str, Any]]:
+    """Generate text and return lightweight runtime telemetry."""
+    if state.model is None or state.tokenizer is None:
+        error = "No model loaded. Please load a model in the Settings tab or pass one at startup."
+        return f"Error: {error}", {"error": error}
+    if not prompt.strip():
+        error = "Enter a prompt before generating."
+        return f"Error: {error}", {"error": error}
+
+    state.model.eval()
+    device = next(state.model.parameters()).device
+    prompt_ids = torch.tensor(
+        [state.tokenizer.encode(prompt)], device=device
+    )
+
+    started = time.perf_counter()
+    with torch.no_grad():
+        output = state.model.generate(
+            prompt_ids,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            stop_token_id=state.tokenizer.eos_token_id,
+        )
+    elapsed_s = max(time.perf_counter() - started, 0.000001)
+
+    generated_ids = output["sequences"][0].cpu().tolist()
+    prompt_len = prompt_ids.shape[1]
+    new_token_ids = generated_ids[prompt_len:]
+    token_count = len(new_token_ids)
+    stats = {
+        "new_tokens": token_count,
+        "elapsed_s": elapsed_s,
+        "tokens_per_second": token_count / elapsed_s,
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_tokens": max_tokens,
+    }
+
+    return state.tokenizer.decode(new_token_ids).strip(), stats
+
+
+def _format_generation_stats(stats: Optional[Dict[str, Any]]) -> str:
+    """Render generation stats for the Chat tab."""
+    if not stats:
+        return "_No response generated yet._"
+    if stats.get("error"):
+        return f"**Last generation:** Error - {stats['error']}"
+    return (
+        "**Last generation:** "
+        f"`{stats['new_tokens']}` new tokens in "
+        f"`{stats['elapsed_s']:.2f}s` "
+        f"(`{stats['tokens_per_second']:.1f}` tok/s) | "
+        f"temperature `{stats['temperature']}` | "
+        f"top-p `{stats['top_p']}` | "
+        f"limit `{stats['max_tokens']}`"
+    )
+
+
+def _format_transcript(history: Optional[List[Dict[str, str]]]) -> str:
+    """Return the current chat transcript as pretty JSON."""
+    return json.dumps(history or [], indent=2, ensure_ascii=False)
+
+
 # --------------------------------------------------------------------------- #
 # Tab handlers
 # --------------------------------------------------------------------------- #
@@ -238,33 +312,16 @@ def _handle_generate(
     state: DashboardState,
 ) -> str:
     """Handle text generation from the Generate tab."""
-    if state.model is None or state.tokenizer is None:
-        return "Error: No model loaded. Please load a model in the Settings tab or pass one at startup."
-    if not prompt.strip():
-        return "Error: Enter a prompt before generating."
-
-    state.model.eval()
-    device = next(state.model.parameters()).device
-    prompt_ids = torch.tensor(
-        [state.tokenizer.encode(prompt)], device=device
+    text, _ = _generate_text(
+        prompt,
+        temperature,
+        top_p,
+        max_tokens,
+        top_k,
+        repetition_penalty,
+        state,
     )
-
-    with torch.no_grad():
-        output = state.model.generate(
-            prompt_ids,
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            repetition_penalty=repetition_penalty,
-            stop_token_id=state.tokenizer.eos_token_id,
-        )
-
-    generated_ids = output["sequences"][0].cpu().tolist()
-    prompt_len = prompt_ids.shape[1]
-    new_token_ids = generated_ids[prompt_len:]
-
-    return state.tokenizer.decode(new_token_ids).strip()
+    return text
 
 
 def _handle_chat(
@@ -276,13 +333,14 @@ def _handle_chat(
     max_tokens: int,
     repetition_penalty: float,
     state: DashboardState,
-) -> tuple[List[Dict[str, str]], str]:
+) -> tuple[List[Dict[str, str]], str, str]:
     """Handle one chat turn in the Chat tab."""
     current_history = list(history or [])
     if not message.strip():
-        return current_history, ""
+        return current_history, "", "_Enter a message to chat._"
 
     if state.model is None or state.tokenizer is None:
+        stats = {"error": "No model loaded."}
         current_history.append({"role": "user", "content": message})
         current_history.append(
             {
@@ -291,14 +349,14 @@ def _handle_chat(
                 "with `selfllm dashboard --model-path ... --tokenizer-path ...`.",
             }
         )
-        return current_history, ""
+        return current_history, "", _format_generation_stats(stats)
 
     prompt = _format_chat_prompt(
         message,
         _messages_to_turns(current_history),
         system_prompt,
     )
-    response = _handle_generate(
+    response, stats = _generate_text(
         prompt=prompt,
         temperature=temperature,
         top_p=top_p,
@@ -312,7 +370,7 @@ def _handle_chat(
         current_history.append({"role": "assistant", "content": response})
     else:
         current_history.append({"role": "assistant", "content": response.strip()})
-    return current_history, ""
+    return current_history, "", _format_generation_stats(stats)
 
 
 def _handle_self_improve_start(
@@ -577,9 +635,18 @@ def create_dashboard(
                     placeholder="Ask the loaded model anything...",
                     lines=3,
                 )
+                gr.Markdown("**Prompt shortcuts**")
+                with gr.Row():
+                    prompt_explain_btn = gr.Button("Explain recursion")
+                    prompt_summarize_btn = gr.Button("Summarize SelfLLM")
+                    prompt_creative_btn = gr.Button("Creative idea")
                 with gr.Row():
                     chat_send_btn = gr.Button("Send", variant="primary")
                     chat_clear_btn = gr.Button("Clear")
+                chat_stats = gr.Markdown(
+                    value=_format_generation_stats(None),
+                    label="Generation Stats",
+                )
                 with gr.Accordion("Generation settings", open=False):
                     chat_system = gr.Textbox(
                         label="System Prompt",
@@ -606,6 +673,14 @@ def create_dashboard(
                             1.0, 2.0, value=1.05, step=0.05,
                             label="Repetition Penalty"
                         )
+                with gr.Accordion("Transcript export", open=False):
+                    chat_export_btn = gr.Button("Refresh Transcript JSON")
+                    chat_transcript = gr.Code(
+                        value="[]",
+                        language="json",
+                        label="Transcript JSON",
+                        interactive=False,
+                    )
 
                 chat_inputs = [
                     chat_input,
@@ -620,17 +695,37 @@ def create_dashboard(
                 chat_send_btn.click(
                     fn=_handle_chat,
                     inputs=chat_inputs,
-                    outputs=[chat_history, chat_input],
+                    outputs=[chat_history, chat_input, chat_stats],
                 )
                 chat_input.submit(
                     fn=_handle_chat,
                     inputs=chat_inputs,
-                    outputs=[chat_history, chat_input],
+                    outputs=[chat_history, chat_input, chat_stats],
                 )
                 chat_clear_btn.click(
-                    fn=lambda: [],
+                    fn=lambda: ([], _format_generation_stats(None), "[]"),
                     inputs=None,
-                    outputs=chat_history,
+                    outputs=[chat_history, chat_stats, chat_transcript],
+                )
+                prompt_explain_btn.click(
+                    fn=lambda: "Explain recursion in one concise paragraph.",
+                    inputs=None,
+                    outputs=chat_input,
+                )
+                prompt_summarize_btn.click(
+                    fn=lambda: "Summarize what SelfLLM is and what this dashboard can do.",
+                    inputs=None,
+                    outputs=chat_input,
+                )
+                prompt_creative_btn.click(
+                    fn=lambda: "Give me one creative idea for using a self-improving LLM.",
+                    inputs=None,
+                    outputs=chat_input,
+                )
+                chat_export_btn.click(
+                    fn=_format_transcript,
+                    inputs=chat_history,
+                    outputs=chat_transcript,
                 )
 
             # ==================== Generate Tab ====================
