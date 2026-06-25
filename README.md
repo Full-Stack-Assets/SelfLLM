@@ -222,6 +222,7 @@ If an iteration degrades performance, the system automatically reverts to the pr
 | `selfllm pretrain` | Pre-train on corpus | `--data-path`, `--num-epochs`, `--batch-size` |
 | `selfllm self-improve` | Recursive improvement loop | `--max-iterations`, `--use-lora`, `--use-dpo` |
 | `selfllm real-training` | Download corpus + train end to end | `--num-books`, `--tokenizer-sample-size`, `--max-chunks` |
+| `selfllm rag-pack` | Pack local docs into grounded prompts | `--docs`, `--query`, `--prompt-output-path` |
 | `selfllm vertex-export` | Prepare Gemini SFT JSONL | `--input-path`, `--train-output-path`, `--validation-ratio` |
 | `selfllm vertex-tune-plan` | Write Vertex tuning request plan | `--project-id`, `--training-dataset-uri`, `--adapter-size` |
 | `selfllm generate` | Interactive text generation | `--prompt`, `--temperature`, `--top-p` |

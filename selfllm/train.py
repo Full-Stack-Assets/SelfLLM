@@ -188,6 +188,14 @@ def merge_config(yaml_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dict
         "epoch_count",
         "learning_rate_multiplier",
         "plan_output_path",
+        "docs",
+        "query",
+        "top_k",
+        "max_context_chars",
+        "chunk_words",
+        "overlap_words",
+        "extensions",
+        "prompt_output_path",
     ):
         _vv = getattr(cli_args, _vk, None)
         if _vv is not None:
@@ -491,6 +499,46 @@ def build_parser() -> argparse.ArgumentParser:
     vertex_plan_parser.add_argument(
         "--plan-output-path", type=str, default="vertex_tuning_request.json",
         help="Where to write the request plan JSON.",
+    )
+
+    # ------------------------------------------------------------------
+    # rag-pack
+    # ------------------------------------------------------------------
+    rag_parser = subparsers.add_parser(
+        "rag-pack",
+        help="Retrieve local document context and pack a grounded prompt.",
+        description=(
+            "Build a source-cited prompt from local .txt/.md documents. "
+            "Use this before tuning to test whether retrieval solves the task."
+        ),
+    )
+    rag_parser.add_argument(
+        "--docs", nargs="+", required=True,
+        help="Document files or directories to search.",
+    )
+    rag_parser.add_argument(
+        "--query", type=str, required=True,
+        help="Question or task to answer using retrieved context.",
+    )
+    rag_parser.add_argument(
+        "--prompt-output-path", type=str, required=True,
+        help="Path for the packed prompt text.",
+    )
+    rag_parser.add_argument(
+        "--manifest-output-path", type=str, default=None,
+        help="Optional JSON manifest path with source chunks and scores.",
+    )
+    rag_parser.add_argument("--top-k", type=int, default=5)
+    rag_parser.add_argument("--max-context-chars", type=int, default=6000)
+    rag_parser.add_argument("--chunk-words", type=int, default=220)
+    rag_parser.add_argument("--overlap-words", type=int, default=40)
+    rag_parser.add_argument(
+        "--extensions", nargs="+", default=None,
+        help="File extensions to include, default: .txt .md.",
+    )
+    rag_parser.add_argument(
+        "--system-instruction", type=str, default=None,
+        help="Optional instruction replacing the default grounded-answer prompt.",
     )
 
     # ------------------------------------------------------------------
@@ -1395,6 +1443,39 @@ def cmd_vertex_tune_plan(cfg: Dict[str, Any], logger: Logger) -> None:
     logger.info(f"Endpoint: {plan['endpoint']}")
 
 
+def cmd_rag_pack(cfg: Dict[str, Any], logger: Logger) -> None:
+    """Pack local retrieved context into a grounded prompt."""
+    from selfllm.cloud.rag_context import build_rag_prompt
+    from selfllm.utils import save_json
+
+    result = build_rag_prompt(
+        paths=cfg["docs"],
+        query=cfg["query"],
+        top_k=cfg.get("top_k", 5),
+        max_context_chars=cfg.get("max_context_chars", 6000),
+        chunk_words=cfg.get("chunk_words", 220),
+        overlap_words=cfg.get("overlap_words", 40),
+        extensions=cfg.get("extensions"),
+        system_instruction=cfg.get("system_instruction"),
+    )
+
+    prompt_path = Path(cfg["prompt_output_path"])
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text(result["prompt"], encoding="utf-8")
+    logger.info(f"Packed prompt saved to {prompt_path}")
+    logger.info(
+        f"Retrieved {len(result['sources'])} source chunks "
+        f"from {result['chunks_loaded']} loaded chunks"
+    )
+
+    manifest_path = cfg.get("manifest_output_path")
+    if manifest_path:
+        manifest = dict(result)
+        manifest.pop("prompt", None)
+        save_json(manifest, manifest_path)
+        logger.info(f"RAG manifest saved to {manifest_path}")
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -1454,6 +1535,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "serve": cmd_serve,
         "vertex-export": cmd_vertex_export,
         "vertex-tune-plan": cmd_vertex_tune_plan,
+        "rag-pack": cmd_rag_pack,
     }
 
     handler = command_map[args.command]

@@ -173,6 +173,7 @@ def test_global_config_flag_parsed_before_subcommand():
         "ppo",
         "vertex-export",
         "vertex-tune-plan",
+        "rag-pack",
     ],
 )
 def test_required_args_missing_exits(cmd):
@@ -230,6 +231,25 @@ def test_vertex_tune_plan_parser_dest_names():
     assert args.training_dataset_uri == "gs://bucket/train.jsonl"
     assert args.adapter_size == 8
     assert args.plan_output_path == "plan.json"
+
+
+def test_rag_pack_parser_dest_names():
+    args = cli.build_parser().parse_args([
+        "rag-pack",
+        "--docs", "docs", "README.md",
+        "--query", "How do I tune Gemini?",
+        "--prompt-output-path", "prompt.txt",
+        "--manifest-output-path", "manifest.json",
+        "--top-k", "3",
+        "--extensions", ".md", ".txt",
+    ])
+    assert args.command == "rag-pack"
+    assert args.docs == ["docs", "README.md"]
+    assert args.query == "How do I tune Gemini?"
+    assert args.prompt_output_path == "prompt.txt"
+    assert args.manifest_output_path == "manifest.json"
+    assert args.top_k == 3
+    assert args.extensions == [".md", ".txt"]
 
 
 def test_serve_defaults():
