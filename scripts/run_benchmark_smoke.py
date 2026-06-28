@@ -209,7 +209,21 @@ def main() -> None:
         patience=3,
         history_path=os.path.join(results_dir, "regression_history.json"),
     )
-    alerts = detector.update(baseline)
+    # Seed the detector with a known-good, non-zero baseline. The smoke model is
+    # tiny and untrained, so its real benchmark scores are 0.0 — feeding those as
+    # the baseline would make the Step 6 "drop to 0.0" a no-op (0.0 → 0.0) that
+    # the detector can never alert on. An explicit synthetic baseline exercises
+    # the alerting logic deterministically, independent of the throwaway model.
+    seed_baseline = SuiteResult(
+        tag="smoke_seed",
+        timestamp=time.time(),
+        results=[
+            EvalResult(name="mmlu", score=0.60, n=5),
+            EvalResult(name="gsm8k", score=0.50, n=5),
+        ],
+        elapsed_s=0.1,
+    )
+    alerts = detector.update(seed_baseline)
     _assert(len(alerts) == 0, f"Expected 0 alerts on first run, got: {alerts}")
     print("[PASS] RegressionDetector: 0 alerts on baseline (correct)")
 
@@ -249,13 +263,15 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # Step 7 — SuiteResult.regression_vs() helper
     # ------------------------------------------------------------------ #
+    # Compare against the synthetic non-zero baseline (the real smoke baseline
+    # scores 0.0, so a 0.0 → 0.0 comparison could never be a regression).
     _assert(
-        crashed.regression_vs(baseline, threshold=0.05),
-        "crashed.regression_vs(baseline) should be True for score drop to 0"
+        crashed.regression_vs(seed_baseline, threshold=0.05),
+        "crashed.regression_vs(seed_baseline) should be True for score drop to 0"
     )
     _assert(
-        not baseline.regression_vs(baseline, threshold=0.05),
-        "baseline.regression_vs(baseline) should be False (same run)"
+        not seed_baseline.regression_vs(seed_baseline, threshold=0.05),
+        "seed_baseline.regression_vs(seed_baseline) should be False (same run)"
     )
     print("[PASS] SuiteResult.regression_vs() helper correct")
 

@@ -226,7 +226,7 @@ class BenchmarkSuite:
             evaluator.add(bench)
             logger.debug("HumanEval: %d problems", len(bench.problems))
 
-        if not evaluator._benchmarks:
+        if not evaluator.benchmarks:
             logger.warning("BenchmarkSuite.run() called with no benchmarks configured.")
             return SuiteResult(
                 tag=tag, timestamp=ts, results=[],
