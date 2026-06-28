@@ -4,9 +4,7 @@ from typing import Dict, List
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from .config import ModelConfig
 from .model import SelfImprovingLLM
 
 

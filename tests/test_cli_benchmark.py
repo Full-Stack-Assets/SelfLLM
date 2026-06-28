@@ -2,7 +2,6 @@
 
 import json
 
-import torch
 
 from selfllm.model.config import ModelConfig
 from selfllm.model.model import SelfImprovingLLM

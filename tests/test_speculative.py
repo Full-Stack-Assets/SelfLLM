@@ -262,7 +262,7 @@ class TestSpeculativeDecoder(unittest.TestCase):
         self.assertTrue(callable(SD))
 
     def test_model_init_export(self):
-        from selfllm.model import SpeculativeDecoder
+        from selfllm.model import SpeculativeDecoder  # noqa: F401
 
         self.assertIn("SpeculativeDecoder", dir())
 

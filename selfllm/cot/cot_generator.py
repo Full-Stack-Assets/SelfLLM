@@ -1,9 +1,8 @@
 """Chain-of-Thought reasoning generation and self-consistency voting."""
 
-import random
 import re
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import torch
 

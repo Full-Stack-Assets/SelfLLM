@@ -26,7 +26,6 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
-import torch.nn as nn
 from torch.cuda.amp import autocast, GradScaler
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import (

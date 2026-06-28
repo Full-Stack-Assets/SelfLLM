@@ -247,7 +247,6 @@ class PPOTrainer:
                 - ``values``: Per-token value estimates
                 - ``rewards``: Per-sequence rewards
         """
-        batch_size = prompt_ids.shape[0]
         prompt_len = prompt_ids.shape[1]
 
         self.policy_model.eval()
@@ -264,7 +263,6 @@ class PPOTrainer:
             )
 
         sequences = gen_result["sequences"]  # [B, prompt_len + gen_len]
-        seq_len = sequences.shape[1]
 
         # Compute the rollout (old) per-token log-probs deterministically:
         # eval() disables dropout so the PPO ratio exp(new - old) starts at 1.0

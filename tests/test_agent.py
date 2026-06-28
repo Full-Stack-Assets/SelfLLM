@@ -9,8 +9,7 @@ Tests cover:
 - Streaming agent run
 """
 
-from typing import Any, Dict, List
-from unittest.mock import MagicMock, patch
+from typing import List
 
 import pytest
 import torch
@@ -19,7 +18,6 @@ from selfllm.model.config import ModelConfig
 from selfllm.model.model import SelfImprovingLLM
 from selfllm.model.tokenizer import BPETokenizer
 from selfllm.tools.agent import Agent
-from selfllm.tools.parser import FunctionCallParser
 from selfllm.tools.registry import ToolRegistry
 
 

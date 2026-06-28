@@ -17,14 +17,11 @@ fewer than 2 GPUs are available.
 
 import os
 import tempfile
-from pathlib import Path
-from typing import Any, Dict
-from unittest.mock import MagicMock, patch
+from typing import Dict
+from unittest.mock import patch
 
 import pytest
 import torch
-import torch.distributed as dist
-import torch.nn as nn
 from torch.utils.data import Dataset, TensorDataset
 
 from selfllm.model.config import ModelConfig
@@ -68,7 +65,7 @@ def _make_dict_dataset(
     num_samples: int = 8,
     seq_len: int = 16,
     vocab_size: int = 128,
-) -> "DictDataset":
+) -> Dataset:
     """Create a Dataset that returns dicts with input_ids and labels."""
     class DictDataset(Dataset):
         def __init__(self, num_samples: int, seq_len: int, vocab_size: int) -> None:
@@ -138,7 +135,7 @@ class TestFSDPConfig:
 
     def test_custom_values(self):
         """Custom values should be stored correctly."""
-        from torch.distributed.fsdp.api import ShardingStrategy, BackwardPrefetch
+        from torch.distributed.fsdp.api import ShardingStrategy
 
         cfg = FSDPConfig(
             sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,

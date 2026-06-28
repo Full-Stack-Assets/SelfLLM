@@ -11,7 +11,7 @@ show up in reports and the dashboard without any per-benchmark wiring.
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Sequence
 
 # Core per-iteration columns shown first, in this order. Each tuple is
 # (metric key, display header, float format).

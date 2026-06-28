@@ -25,8 +25,6 @@ import argparse
 import json
 import logging
 import os
-import sys
-import time
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -34,10 +32,8 @@ import torch
 from selfllm.data.pipeline import DataPipeline
 from selfllm.model.config import ModelConfig
 from selfllm.model.model import SelfImprovingLLM
-from selfllm.model.tokenizer import BPETokenizer
 from selfllm.recursive.recursive_config import RecursiveConfig
 from selfllm.recursive.recursive_trainer import RecursiveSelfTrainer
-from selfllm.training.dataset import SelfTrainingDataset
 from selfllm.training.trainer import LLMTrainer
 from selfllm.utils import count_parameters, format_num, get_device, set_seed
 
@@ -159,7 +155,7 @@ def train_real_model(
     }[scale]
     config = config_fn()
 
-    print(f"\n[Step 1] Model Config:")
+    print("\n[Step 1] Model Config:")
     print(
         f"  Layers: {config.n_layers} | Heads: {config.n_heads} | "
         f"Dim: {config.d_model}"
@@ -182,7 +178,7 @@ def train_real_model(
     # ------------------------------------------------------------------ #
     # Step 3: Train tokenizer
     # ------------------------------------------------------------------ #
-    print(f"\n[Step 3] Training BPE tokenizer...")
+    print("\n[Step 3] Training BPE tokenizer...")
     tokenizer = pipeline.train_tokenizer_on_corpus(
         corpus_dir=os.path.join(data_dir, "books"),
         vocab_size=config.vocab_size,
@@ -196,7 +192,7 @@ def train_real_model(
     # ------------------------------------------------------------------ #
     # Step 4: Create dataset
     # ------------------------------------------------------------------ #
-    print(f"\n[Step 4] Creating training dataset...")
+    print("\n[Step 4] Creating training dataset...")
     dataset = pipeline.create_training_dataset(
         corpus_dir=os.path.join(data_dir, "books"),
         output_path=os.path.join(data_dir, "train_dataset.pt"),
@@ -207,7 +203,7 @@ def train_real_model(
     # ------------------------------------------------------------------ #
     # Step 5: Initialize model
     # ------------------------------------------------------------------ #
-    print(f"\n[Step 5] Initializing model...")
+    print("\n[Step 5] Initializing model...")
     model = SelfImprovingLLM(config)
     total_params = count_parameters(model)
     print(f"  Model: {format_num(total_params)} parameters ({total_params / 1e6:.1f}M)")
@@ -239,7 +235,7 @@ def train_real_model(
     )
 
     history = trainer.train(dataset, num_epochs=pretrain_epochs)
-    print(f"  Pre-training complete!")
+    print("  Pre-training complete!")
     print(f"  Final loss: {history['train_loss'][-1]:.4f}")
 
     # Save pre-trained model
@@ -250,7 +246,7 @@ def train_real_model(
     # ------------------------------------------------------------------ #
     # Step 7: Test generation
     # ------------------------------------------------------------------ #
-    print(f"\n[Step 7] Testing generation...")
+    print("\n[Step 7] Testing generation...")
     test_prompts = [
         "Once upon a time",
         "The science of",
@@ -321,7 +317,7 @@ def train_real_model(
             patience=rec_config.patience,
         )
 
-        print(f"\n  Self-improvement complete!")
+        print("\n  Self-improvement complete!")
         for m in iteration_metrics:
             print(
                 f"  Iter {m['iteration']}: gen={m['samples_generated']}, "

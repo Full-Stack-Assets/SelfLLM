@@ -9,7 +9,7 @@ Provides:
 
 import math
 import warnings
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -192,7 +192,6 @@ class QuantizedLinear(nn.Module):
         scales = self.scales.to(q.device)[group_indices]
         zeros = self.zeros.to(q.device)[group_indices]
 
-        qmax = 2**self.bits - 1
         # Dequantize: w = (q / qmax) * scale + zero_point  ... wait, standard is:
         # w = (q - zp) * scale, where zp is the zero-point in quantized space
         # We stored zero_point as w_min, and scale = (w_max - w_min) / qmax

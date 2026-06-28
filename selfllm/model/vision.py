@@ -6,8 +6,7 @@ Architecture:
       image patch embeddings with text token embeddings before the LLM backbone.
 """
 
-import math
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn

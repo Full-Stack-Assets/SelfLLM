@@ -6,8 +6,8 @@ import math
 import os
 import re
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List
 
 
 @dataclass
@@ -239,18 +239,27 @@ class ToolRegistry:
             left = cls._eval_calc_node(node.left)
             right = cls._eval_calc_node(node.right)
             op = node.op
-            if isinstance(op, ast.Add): return left + right
-            if isinstance(op, ast.Sub): return left - right
-            if isinstance(op, ast.Mult): return left * right
-            if isinstance(op, ast.Div): return left / right
-            if isinstance(op, ast.FloorDiv): return left // right
-            if isinstance(op, ast.Mod): return left % right
-            if isinstance(op, ast.Pow): return left ** right
+            if isinstance(op, ast.Add):
+                return left + right
+            if isinstance(op, ast.Sub):
+                return left - right
+            if isinstance(op, ast.Mult):
+                return left * right
+            if isinstance(op, ast.Div):
+                return left / right
+            if isinstance(op, ast.FloorDiv):
+                return left // right
+            if isinstance(op, ast.Mod):
+                return left % right
+            if isinstance(op, ast.Pow):
+                return left ** right
             raise ValueError("unsupported operator")
         if isinstance(node, ast.UnaryOp):
             operand = cls._eval_calc_node(node.operand)
-            if isinstance(node.op, ast.UAdd): return +operand
-            if isinstance(node.op, ast.USub): return -operand
+            if isinstance(node.op, ast.UAdd):
+                return +operand
+            if isinstance(node.op, ast.USub):
+                return -operand
             raise ValueError("unsupported unary operator")
         if isinstance(node, ast.Call):
             if not isinstance(node.func, ast.Name) or node.func.id not in cls._CALC_FUNCS:

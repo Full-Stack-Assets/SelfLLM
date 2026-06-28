@@ -6,7 +6,6 @@ import time
 from typing import Any, Dict, List, Optional
 
 import torch
-import torch.nn as nn
 from torch.cuda.amp import autocast, GradScaler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR

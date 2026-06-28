@@ -1,6 +1,5 @@
 """Tests for V6 Wave 3: reasoning strategies wired into the eval harness."""
 
-import pytest
 import torch
 
 from selfllm.eval import GSM8KBenchmark, MMLUBenchmark
