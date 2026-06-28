@@ -22,9 +22,9 @@ setup(
         # Vector retrieval for RAG / long-context memory.
         "rag": ["faiss-cpu>=1.7.0"],
         # Web dashboard.
-        "dashboard": ["gradio>=4.0.0"],
+        "dashboard": ["gradio>=4.44.1"],
         # Test suite.
-        "dev": ["pytest>=7.0.0", "pytest-cov>=4.0.0"],
+        "dev": ["pytest>=7.4.4", "pytest-cov>=5.0.0"],
     },
     include_package_data=True,
     package_data={
