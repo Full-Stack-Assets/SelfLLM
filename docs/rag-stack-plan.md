@@ -255,7 +255,10 @@ a `needs_more_retrieval` tool call only when evidence is insufficient (this reso
 
 ```python
 # Simplified orchestrator pseudo-code
-query, tenant_id, role = request.user_query, request.tenant_id, request.user.role
+# tenant_id and roles come from the authenticated identity (set by api-gateway from the
+# OIDC token), NOT from the request body — a request-supplied tenant/role must never widen access.
+query = request.user_query
+tenant_id, role = auth.tenant_id, auth.user_roles
 
 # 1. Query rewriting (utility engine) + 2. retrieval fanned out in parallel over variants
 rewritten = await call_llm(model="utility", system_prompt=REWRITE_PROMPT, messages=[...])

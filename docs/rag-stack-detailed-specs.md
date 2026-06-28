@@ -55,7 +55,8 @@ Request:
 }
 ```
 
-- `queries`: rewritten variants from the utility model; each ≤ 512 tokens (422 if exceeded).
+- `queries`: rewritten variants from the utility model; each query must be ≤ 512 tokens — the
+  service returns **HTTP 422** if a query exceeds that limit.
 - `filters`: metadata constraints, AND-ed. **No `acl_tags` here** — ACL comes from the
   authenticated roles (see correction above). `source`/timestamp filters are intersected with
   the tenant namespace.
@@ -78,7 +79,7 @@ Response:
   "candidates": [
     {
       "doc_id": "doc_1",
-      "chunk_id": "doc_1#18",
+      "chunk_id": "18",
       "title": "Security Policy Update",
       "source_type": "wiki",
       "timestamp": "2026-03-11T00:00:00Z",
@@ -114,7 +115,7 @@ Cross-encoder rerank over caller-supplied candidates.
 ```json
 {
   "query": "What changed in our SOC2 password rotation policy after March?",
-  "candidates": [{ "doc_id": "doc_1", "chunk_id": "doc_1#18", "text": "Effective March 15, 2026..." }],
+  "candidates": [{ "doc_id": "doc_1", "chunk_id": "18", "text": "Effective March 15, 2026..." }],
   "top_k": 20,
   "return_scores": true
 }
@@ -162,7 +163,10 @@ grounded in cited chunks.
 > span)` but every example cited `[doc_1]` — dropping the `chunk_id` and span that the typed
 > `Citation` model and `response-validator` need to align spans. Standardize on
 > **`[doc_id#chunk_id]`** inline, with the validator resolving `char_start/char_end` against
-> the cited chunk's text. This makes citation faithfulness mechanically checkable.
+> the cited chunk's text. This makes citation faithfulness mechanically checkable. Note
+> `chunk_id` is the *within-document* chunk identifier only (e.g. `"18"`); the `doc_id#chunk_id`
+> form is composed in exactly one place (the renderer) so it is never doubled into
+> `doc_1#doc_1#18`.
 
 ### 2.2 Task templates
 
