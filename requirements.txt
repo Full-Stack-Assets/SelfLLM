@@ -1,9 +1,9 @@
 # Lower bounds are kept at known-secure minimums so the declared ranges no
 # longer admit versions with published advisories (scanners flag the floor, not
-# the latest resolved version). torch is intentionally held at >=2.2.0 to stay
-# compatible with the CI-pinned torch==2.2.2+cpu wheel; advancing it further
-# requires bumping the CI pin in lockstep (see PR notes).
-torch>=2.2.0
+# the latest resolved version). The torch floor is >=2.6.0 to clear the
+# torch.load RCE (CVE-2025-32434) and is kept in lockstep with the CI pin
+# torch==2.12.1+cpu (see .github/workflows/*.yml).
+torch>=2.6.0
 numpy>=1.26.0
 tqdm>=4.66.3
 pyyaml>=6.0.1
