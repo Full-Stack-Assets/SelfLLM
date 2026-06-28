@@ -5,7 +5,7 @@ store in fixed-size blocks, allocate on demand, share via copy-on-write.
 """
 
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, Optional
 
 from selfllm.cot.cot_generator import ChainOfThoughtGenerator
 

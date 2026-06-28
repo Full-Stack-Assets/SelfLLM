@@ -18,7 +18,6 @@ import os
 from fractions import Fraction
 
 import pytest
-import torch
 
 from selfllm.model.config import ModelConfig
 from selfllm.model.tokenizer import BPETokenizer

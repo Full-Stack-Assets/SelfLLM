@@ -5,15 +5,13 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
-import torch
 
 # Ensure the project root is on the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from selfllm.model.config import ModelConfig
 from selfllm.model.model import SelfImprovingLLM
 from selfllm.real_training import (
     get_full_config,

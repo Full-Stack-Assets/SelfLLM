@@ -11,12 +11,9 @@ Tests cover:
 """
 
 import sys
-from typing import Dict, List
 
 import pytest
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 sys.path.insert(0, "/home/kimi/work-constitutional")
 

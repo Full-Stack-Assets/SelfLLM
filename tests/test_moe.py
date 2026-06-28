@@ -8,11 +8,9 @@ Tests cover:
 - Gradient flow and load balancing
 """
 
-import math
 
 import pytest
 import torch
-import torch.nn as nn
 
 from selfllm.model.config import ModelConfig
 from selfllm.model.moe import ExpertFFN, MoELayer, MoETransformerBlock, Router

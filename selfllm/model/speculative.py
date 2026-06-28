@@ -1,9 +1,8 @@
 """Speculative decoding for faster generation using a small draft model."""
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 from selfllm.model.config import ModelConfig
@@ -207,7 +206,6 @@ class SpeculativeDecoder:
 
             # ---- 3. Accept/reject each draft token ----
             accepted = []
-            rejected = False
             n_draft_accepted = 0  # draft tokens accepted this round (pre-trim)
 
             for k in range(draft_tokens.shape[1]):
@@ -221,7 +219,6 @@ class SpeculativeDecoder:
                         n_draft_accepted += 1
                     else:
                         accepted.append(target_best)
-                        rejected = True
                         break
                 else:
                     # Stochastic: use probability ratio acceptance
@@ -233,7 +230,6 @@ class SpeculativeDecoder:
                         accepted.append(
                             torch.argmax(target_probs[0, k]).item()
                         )
-                        rejected = True
                         break
 
                     acceptance_prob = min(1.0, p_t / p_d)
@@ -254,7 +250,6 @@ class SpeculativeDecoder:
                         else:
                             new_token = torch.argmax(target_probs[0, k]).item()
                         accepted.append(new_token)
-                        rejected = True
                         break
 
             # Apply the budget cap first, then stop at EOS within the surviving

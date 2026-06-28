@@ -4,7 +4,6 @@ import sys
 import unittest
 
 import torch
-import torch.nn.functional as F
 
 # Ensure project root is importable
 sys.path.insert(0, "/home/kimi/work-longcontext")
@@ -63,7 +62,7 @@ class TestSlidingWindowAttention(unittest.TestCase):
         for _ in range(self.window_size + 4):
             tok = torch.randn(self.batch_size, 1, self.d_model)
             out_t, current_cache = attn(tok, kv_cache=current_cache)
-            self.assertFalse(torch.isnan(out_t).any(), f"NaN at generation step")
+            self.assertFalse(torch.isnan(out_t).any(), "NaN at generation step")
 
         # Cache should have accumulated
         cached_k, cached_v = current_cache

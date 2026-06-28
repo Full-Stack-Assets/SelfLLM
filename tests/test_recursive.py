@@ -6,8 +6,7 @@ Tests cover:
 - Overall recursive trainer flow
 """
 
-from typing import Any, Dict, List
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -384,14 +383,6 @@ class TestRecursiveTrainer:
             tokenizer=mock_tokenizer,
             device="cpu",
         )
-
-        # Test with sample data
-        samples = [
-            {"prompt": "Explain A:", "response": "A is the first letter of the alphabet."},
-            {"prompt": "Explain B:", "response": "B comes after A."},
-            {"prompt": "Explain C:", "response": "C C C C C C C C C C C C C C C C C C C C"},  # Low diversity
-            {"prompt": "Explain D:", "response": "D is the fourth letter and has many uses in programming and music theory."},
-        ]
 
         # Mock perplexity computation to return predictable values
         def mock_compute_perplexity(text: str) -> float:

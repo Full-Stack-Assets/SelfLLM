@@ -12,12 +12,9 @@ Tests cover:
 - Tool prompt injection (contains tool descriptions)
 """
 
-import json
 import os
-import re
 import tempfile
 from datetime import datetime
-from pathlib import Path
 
 import pytest
 

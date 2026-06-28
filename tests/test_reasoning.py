@@ -1,7 +1,6 @@
 """Tests for the V6 reasoning core (selfllm.reasoning)."""
 
 import pytest
-import torch
 
 from selfllm.model.config import ModelConfig
 from selfllm.model.model import SelfImprovingLLM
