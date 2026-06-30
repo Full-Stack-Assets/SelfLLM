@@ -5,6 +5,7 @@ Provides subcommands for the full model lifecycle:
     python -m selfllm init           # Initialize model & tokenizer
     python -m selfllm pretrain       # Pre-train on seed corpus
     python -m selfllm self-improve   # Run recursive self-improvement
+    python -m selfllm personalize  # Build a personalized frontier LLM
     python -m selfllm generate       # Generate text from trained model
     python -m selfllm evaluate       # Evaluate model quality
     python -m selfllm benchmark      # MMLU / GSM8K / HumanEval (+ reasoning lift)
@@ -143,6 +144,50 @@ def merge_config(yaml_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dict
         real_cfg["use_dpo"] = cli_args.use_dpo
     merged["real_training"] = real_cfg
 
+    # Personalization config
+    personalize_cfg = dict(yaml_cfg.get("personalization", {}))
+    if getattr(cli_args, "personalize_scale", None) is not None:
+        personalize_cfg["scale"] = cli_args.personalize_scale
+    if getattr(cli_args, "profile", None) is not None:
+        personalize_cfg["profile"] = cli_args.profile
+    if getattr(cli_args, "corpus_path", None) is not None:
+        personalize_cfg["corpus_path"] = cli_args.corpus_path
+    if getattr(cli_args, "base_model_path", None) is not None:
+        personalize_cfg["base_model_path"] = cli_args.base_model_path
+    if getattr(cli_args, "base_tokenizer_path", None) is not None:
+        personalize_cfg["base_tokenizer_path"] = cli_args.base_tokenizer_path
+    if getattr(cli_args, "pretrain_epochs", None) is not None:
+        personalize_cfg["pretrain_epochs"] = cli_args.pretrain_epochs
+    if getattr(cli_args, "pretrain_batch_size", None) is not None:
+        personalize_cfg["pretrain_batch_size"] = cli_args.pretrain_batch_size
+    if getattr(cli_args, "pretrain_lr", None) is not None:
+        personalize_cfg["pretrain_lr"] = cli_args.pretrain_lr
+    if getattr(cli_args, "self_improve_iterations", None) is not None:
+        personalize_cfg["self_improve_iterations"] = cli_args.self_improve_iterations
+    if getattr(cli_args, "use_lora", None) is not None:
+        personalize_cfg["use_lora"] = cli_args.use_lora
+    if getattr(cli_args, "lora_rank", None) is not None:
+        personalize_cfg["lora_rank"] = cli_args.lora_rank
+    if getattr(cli_args, "use_dpo", None) is not None:
+        personalize_cfg["use_dpo"] = cli_args.use_dpo
+    if getattr(cli_args, "use_constitutional", None) is not None:
+        personalize_cfg["use_constitutional"] = cli_args.use_constitutional
+    if getattr(cli_args, "max_chunks", None) is not None:
+        personalize_cfg["max_chunks"] = cli_args.max_chunks
+    merged["personalization"] = personalize_cfg
+    if getattr(cli_args, "profile", None) is not None:
+        merged["profile"] = cli_args.profile
+    if getattr(cli_args, "corpus_path", None) is not None:
+        merged["corpus_path"] = cli_args.corpus_path
+    if yaml_cfg.get("profile"):
+        merged.setdefault("profile", yaml_cfg["profile"])
+    if yaml_cfg.get("corpus_path"):
+        merged.setdefault("corpus_path", yaml_cfg["corpus_path"])
+    if yaml_cfg.get("output_dir"):
+        merged.setdefault("output_dir", yaml_cfg["output_dir"])
+    if getattr(cli_args, "output_dir", None) is not None:
+        merged["output_dir"] = cli_args.output_dir
+
     # Paths & runtime
     merged["checkpoint_dir"] = getattr(cli_args, "checkpoint_dir", None) or yaml_cfg.get("checkpoint_dir", "./checkpoints")
     merged["device"] = getattr(cli_args, "device", None) or yaml_cfg.get("device", get_device())
@@ -189,6 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
               %(prog)s init --vocab-size 32000 --d-model 512 --save-path ./checkpoints/base
               %(prog)s pretrain --config config.yaml --data-path data/corpus.txt
               %(prog)s self-improve --model-path ./checkpoints/base --max-iterations 10
+              %(prog)s personalize --corpus-path ./my_writing --profile personalize.yaml
               %(prog)s generate --model-path ./checkpoints/best --prompt "Explain recursion"
               %(prog)s evaluate --model-path ./checkpoints/best --eval-data data/eval.txt
               %(prog)s dashboard --model-path ./checkpoints/best --tokenizer-path ./checkpoints/tokenizer.json --port 7860
@@ -376,6 +422,88 @@ def build_parser() -> argparse.ArgumentParser:
     real_train_parser.add_argument(
         "--no-dpo", dest="use_dpo", action="store_false",
         help="Disable DPO for preference learning.",
+    )
+
+    # ------------------------------------------------------------------
+    # personalize
+    # ------------------------------------------------------------------
+    personalize_parser = subparsers.add_parser(
+        "personalize",
+        help="Build a personalized frontier LLM from your text corpus.",
+        description=(
+            "Train a frontier-architecture SelfLLM (MoE + LoRA + DPO) on your own "
+            "writing and profile. Provide a directory or .txt file of personal text."
+        ),
+    )
+    personalize_parser.add_argument(
+        "--corpus-path", type=str, required=True,
+        help="Path to personal text corpus (.txt file or directory of .txt files).",
+    )
+    personalize_parser.add_argument(
+        "--profile", type=str, default=None,
+        help="YAML profile with name, topics, style, and eval prompts.",
+    )
+    personalize_parser.add_argument(
+        "--output-dir", type=str, default="./personalized_model",
+        help="Directory for the personalized model (default: ./personalized_model).",
+    )
+    personalize_parser.add_argument(
+        "--personalize-scale",
+        choices=["small", "medium", "full"],
+        default="small",
+        help="Frontier model scale when not using --base-model-path (default: small).",
+    )
+    personalize_parser.add_argument(
+        "--base-model-path", type=str, default=None,
+        help="Optional existing model checkpoint to personalize instead of fresh init.",
+    )
+    personalize_parser.add_argument(
+        "--base-tokenizer-path", type=str, default=None,
+        help="Tokenizer for --base-model-path (required when base model is set).",
+    )
+    personalize_parser.add_argument(
+        "--pretrain-epochs", type=int, default=3,
+        help="Pre-training epochs on user corpus (default: 3).",
+    )
+    personalize_parser.add_argument(
+        "--pretrain-batch-size", type=int, default=8,
+        help="Pre-training batch size (default: 8).",
+    )
+    personalize_parser.add_argument(
+        "--pretrain-lr", type=float, default=1e-3,
+        help="Pre-training learning rate (default: 1e-3).",
+    )
+    personalize_parser.add_argument(
+        "--self-improve-iterations", type=int, default=5,
+        help="Recursive self-improvement iterations (default: 5, 0 to skip).",
+    )
+    personalize_parser.add_argument(
+        "--use-lora", action="store_true", default=True,
+        help="Use LoRA for self-improvement (default: True).",
+    )
+    personalize_parser.add_argument(
+        "--no-lora", dest="use_lora", action="store_false",
+        help="Disable LoRA for self-improvement.",
+    )
+    personalize_parser.add_argument(
+        "--lora-rank", type=int, default=8,
+        help="LoRA rank (default: 8).",
+    )
+    personalize_parser.add_argument(
+        "--use-dpo", action="store_true", default=True,
+        help="Use DPO for preference learning (default: True).",
+    )
+    personalize_parser.add_argument(
+        "--no-dpo", dest="use_dpo", action="store_false",
+        help="Disable DPO for preference learning.",
+    )
+    personalize_parser.add_argument(
+        "--use-constitutional", action="store_true", default=False,
+        help="Enable constitutional AI revision during self-improvement.",
+    )
+    personalize_parser.add_argument(
+        "--max-chunks", type=int, default=0,
+        help="Maximum training chunks; 0 uses all chunks (default: 0).",
     )
 
     # ------------------------------------------------------------------
@@ -1014,6 +1142,53 @@ def cmd_real_training(cfg: Dict[str, Any], logger: Logger) -> None:
     logger.info(f"Results saved to {results_path}")
 
 
+def cmd_personalize(cfg: Dict[str, Any], logger: Logger) -> None:
+    """Build a personalized frontier LLM from user corpus and profile."""
+    from selfllm.personalization.personalize import personalize_model
+
+    pers_cfg = cfg.get("personalization", {})
+    corpus_path = cfg.get("corpus_path") or pers_cfg.get("corpus_path", "")
+    profile_path = cfg.get("profile") or pers_cfg.get("profile")
+    output_dir = cfg.get("output_dir") or pers_cfg.get("output_dir", "./personalized_model")
+
+    if not corpus_path:
+        logger.error("corpus_path is required for personalization")
+        sys.exit(1)
+
+    scale = pers_cfg.get("scale", cfg.get("personalize_scale", "small"))
+    max_chunks = pers_cfg.get("max_chunks", cfg.get("max_chunks", 0))
+    if max_chunks == 0:
+        max_chunks = None
+
+    logger.info(f"Personalizing frontier model for corpus: {corpus_path}")
+    if profile_path:
+        logger.info(f"Profile: {profile_path}")
+
+    results = personalize_model(
+        corpus_path=corpus_path,
+        output_dir=output_dir,
+        profile_path=profile_path,
+        base_model_path=pers_cfg.get("base_model_path"),
+        base_tokenizer_path=pers_cfg.get("base_tokenizer_path"),
+        scale=scale,
+        pretrain_epochs=pers_cfg.get("pretrain_epochs", 3),
+        pretrain_batch_size=pers_cfg.get("pretrain_batch_size", 8),
+        pretrain_lr=pers_cfg.get("pretrain_lr", 1e-3),
+        self_improve_iterations=pers_cfg.get("self_improve_iterations", 5),
+        use_lora=pers_cfg.get("use_lora", True),
+        lora_rank=pers_cfg.get("lora_rank", 8),
+        use_dpo=pers_cfg.get("use_dpo", True),
+        use_constitutional=pers_cfg.get("use_constitutional", False),
+        max_chunks=max_chunks,
+        device=cfg["device"],
+        seed=cfg.get("seed", 42),
+    )
+
+    logger.info(f"Personalization complete. Model saved to {results['final_model_path']}")
+    logger.info(f"Tokenizer: {results['tokenizer_path']}")
+    logger.info(f"Manifest: {results['manifest_path']}")
+
+
 def cmd_generate(cfg: Dict[str, Any], logger: Logger) -> None:
     """Generate text from a trained model."""
     from selfllm.model.model import SelfImprovingLLM
@@ -1369,6 +1544,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "ppo": cmd_ppo,
         "self-improve": cmd_self_improve,
         "real-training": cmd_real_training,
+        "personalize": cmd_personalize,
         "generate": cmd_generate,
         "evaluate": cmd_evaluate,
         "benchmark": cmd_benchmark,

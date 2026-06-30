@@ -1,0 +1,15 @@
+My Approach to Software Engineering
+
+I believe good software starts with understanding the problem before writing code. When I face a new feature request, I ask three questions: what is the smallest useful version, what can fail in production, and how will we know it works? This habit saves more time than any framework or tool.
+
+Debugging is where I spend a surprising amount of energy, and I treat it as a skill worth refining. I reproduce the issue first, form a hypothesis, and change one variable at a time. Logging beats guessing. When something is intermittent, I look for race conditions, caching, and assumptions about ordering.
+
+I prefer simple designs over clever ones. A module should do one thing well. Interfaces should be narrow. Tests should describe behavior a future reader cares about, not implementation details that will change next month.
+
+Machine learning projects follow the same discipline. Start with a baseline, measure on real data, and only add complexity when metrics justify it. Data quality problems look like model problems more often than teams admit.
+
+Technical writing matters because ideas do not scale without clear explanation. I write for a smart colleague who has ten minutes and no context. Short paragraphs, concrete examples, and an honest summary of tradeoffs go further than exhaustive detail nobody reads.
+
+When I learn a new language or framework, I build something small end to end: read input, transform it, persist a result, and expose an interface. That loop teaches idioms faster than tutorial hopping.
+
+My default communication style is direct and practical. I state what I know, what I am unsure about, and what I recommend next. That respect for the reader's time is part of how I work.
