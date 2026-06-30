@@ -171,6 +171,40 @@ def merge_config(yaml_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dict
     merged["output_path"] = getattr(cli_args, "output_path", None) or yaml_cfg.get("output_path", "")
     merged["interactive"] = getattr(cli_args, "interactive", False)
 
+    # Vertex AI / managed foundation-model tuning helpers
+    for _vk in (
+        "input_path",
+        "train_output_path",
+        "validation_output_path",
+        "validation_ratio",
+        "max_examples",
+        "min_prompt_chars",
+        "min_response_chars",
+        "system_instruction",
+        "manifest_output_path",
+        "project_id",
+        "location",
+        "base_model",
+        "training_dataset_uri",
+        "validation_dataset_uri",
+        "tuned_model_display_name",
+        "adapter_size",
+        "epoch_count",
+        "learning_rate_multiplier",
+        "plan_output_path",
+        "docs",
+        "query",
+        "top_k",
+        "max_context_chars",
+        "chunk_words",
+        "overlap_words",
+        "extensions",
+        "prompt_output_path",
+    ):
+        _vv = getattr(cli_args, _vk, None)
+        if _vv is not None:
+            merged[_vk] = _vv
+
     return merged
 
 
@@ -376,6 +410,140 @@ def build_parser() -> argparse.ArgumentParser:
     real_train_parser.add_argument(
         "--no-dpo", dest="use_dpo", action="store_false",
         help="Disable DPO for preference learning.",
+    )
+
+    # ------------------------------------------------------------------
+    # vertex-export
+    # ------------------------------------------------------------------
+    vertex_export_parser = subparsers.add_parser(
+        "vertex-export",
+        help="Export prompt/response samples to Vertex AI Gemini SFT JSONL.",
+        description=(
+            "Convert a SelfLLM JSON/JSONL prompt-response dataset into the "
+            "Gemini supervised tuning JSONL format used by Vertex AI."
+        ),
+    )
+    vertex_export_parser.add_argument(
+        "--input-path", type=str, required=True,
+        help="Input JSON/JSONL file with prompt and response fields.",
+    )
+    vertex_export_parser.add_argument(
+        "--train-output-path", type=str, required=True,
+        help="Output path for the Vertex training JSONL file.",
+    )
+    vertex_export_parser.add_argument(
+        "--validation-output-path", type=str, default=None,
+        help="Optional output path for validation JSONL.",
+    )
+    vertex_export_parser.add_argument(
+        "--validation-ratio", type=float, default=0.0,
+        help="Fraction of examples to hold out when validation output is set.",
+    )
+    vertex_export_parser.add_argument(
+        "--max-examples", type=int, default=None,
+        help="Maximum number of valid examples to export.",
+    )
+    vertex_export_parser.add_argument(
+        "--min-prompt-chars", type=int, default=1,
+        help="Minimum prompt length; shorter samples are skipped.",
+    )
+    vertex_export_parser.add_argument(
+        "--min-response-chars", type=int, default=1,
+        help="Minimum response length; shorter samples are skipped.",
+    )
+    vertex_export_parser.add_argument(
+        "--system-instruction", type=str, default=None,
+        help="Optional instruction prepended to every user prompt.",
+    )
+    vertex_export_parser.add_argument(
+        "--manifest-output-path", type=str, default=None,
+        help="Optional path for an export manifest JSON.",
+    )
+
+    # ------------------------------------------------------------------
+    # vertex-tune-plan
+    # ------------------------------------------------------------------
+    vertex_plan_parser = subparsers.add_parser(
+        "vertex-tune-plan",
+        help="Write a Vertex AI tuningJobs.create request plan.",
+        description=(
+            "Create a local REST request payload for a Gemini supervised "
+            "tuning job. This does not call Google Cloud."
+        ),
+    )
+    vertex_plan_parser.add_argument("--project-id", type=str, required=True)
+    vertex_plan_parser.add_argument("--location", type=str, default="us-central1")
+    vertex_plan_parser.add_argument(
+        "--base-model", type=str, default="gemini-2.5-flash",
+        help="Foundation model to tune (default: gemini-2.5-flash).",
+    )
+    vertex_plan_parser.add_argument(
+        "--training-dataset-uri", type=str, required=True,
+        help="GCS URI for the training JSONL, e.g. gs://bucket/train.jsonl.",
+    )
+    vertex_plan_parser.add_argument(
+        "--validation-dataset-uri", type=str, default=None,
+        help="Optional GCS URI for validation JSONL.",
+    )
+    vertex_plan_parser.add_argument(
+        "--tuned-model-display-name", type=str, default=None,
+        help="Optional display name for the tuned model.",
+    )
+    vertex_plan_parser.add_argument(
+        "--adapter-size", type=int, choices=[1, 4, 8, 16], default=None,
+        help="Optional Vertex adapter size.",
+    )
+    vertex_plan_parser.add_argument(
+        "--epoch-count", type=int, default=None,
+        help="Optional epoch count; omit to let Vertex choose.",
+    )
+    vertex_plan_parser.add_argument(
+        "--learning-rate-multiplier", type=float, default=None,
+        help="Optional learning-rate multiplier.",
+    )
+    vertex_plan_parser.add_argument(
+        "--plan-output-path", type=str, default="vertex_tuning_request.json",
+        help="Where to write the request plan JSON.",
+    )
+
+    # ------------------------------------------------------------------
+    # rag-pack
+    # ------------------------------------------------------------------
+    rag_parser = subparsers.add_parser(
+        "rag-pack",
+        help="Retrieve local document context and pack a grounded prompt.",
+        description=(
+            "Build a source-cited prompt from local .txt/.md documents. "
+            "Use this before tuning to test whether retrieval solves the task."
+        ),
+    )
+    rag_parser.add_argument(
+        "--docs", nargs="+", required=True,
+        help="Document files or directories to search.",
+    )
+    rag_parser.add_argument(
+        "--query", type=str, required=True,
+        help="Question or task to answer using retrieved context.",
+    )
+    rag_parser.add_argument(
+        "--prompt-output-path", type=str, required=True,
+        help="Path for the packed prompt text.",
+    )
+    rag_parser.add_argument(
+        "--manifest-output-path", type=str, default=None,
+        help="Optional JSON manifest path with source chunks and scores.",
+    )
+    rag_parser.add_argument("--top-k", type=int, default=5)
+    rag_parser.add_argument("--max-context-chars", type=int, default=6000)
+    rag_parser.add_argument("--chunk-words", type=int, default=220)
+    rag_parser.add_argument("--overlap-words", type=int, default=40)
+    rag_parser.add_argument(
+        "--extensions", nargs="+", default=None,
+        help="File extensions to include, default: .txt .md.",
+    )
+    rag_parser.add_argument(
+        "--system-instruction", type=str, default=None,
+        help="Optional instruction replacing the default grounded-answer prompt.",
     )
 
     # ------------------------------------------------------------------
@@ -1316,6 +1484,95 @@ def cmd_serve(cfg: Dict[str, Any], logger: Logger) -> None:
     )
 
 
+def cmd_vertex_export(cfg: Dict[str, Any], logger: Logger) -> None:
+    """Export a prompt/response dataset for Vertex AI Gemini tuning."""
+    from selfllm.cloud.vertex_tuning import export_vertex_sft_dataset
+    from selfllm.utils import save_json
+
+    manifest = export_vertex_sft_dataset(
+        input_path=cfg["input_path"],
+        train_output_path=cfg["train_output_path"],
+        validation_output_path=cfg.get("validation_output_path"),
+        validation_ratio=cfg.get("validation_ratio", 0.0),
+        max_examples=cfg.get("max_examples"),
+        min_prompt_chars=cfg.get("min_prompt_chars", 1),
+        min_response_chars=cfg.get("min_response_chars", 1),
+        system_instruction=cfg.get("system_instruction"),
+        seed=cfg.get("seed", 42),
+    )
+
+    logger.info(f"Vertex training JSONL: {manifest['train_output_path']}")
+    logger.info(f"Training examples: {manifest['train_examples']}")
+    if manifest["validation_output_path"]:
+        logger.info(f"Vertex validation JSONL: {manifest['validation_output_path']}")
+        logger.info(f"Validation examples: {manifest['validation_examples']}")
+    logger.info(
+        "Skipped samples: "
+        f"empty_prompt={manifest['skipped_empty_prompt']} "
+        f"empty_response={manifest['skipped_empty_response']}"
+    )
+
+    manifest_path = cfg.get("manifest_output_path")
+    if manifest_path:
+        save_json(manifest, manifest_path)
+        logger.info(f"Manifest saved to {manifest_path}")
+
+
+def cmd_vertex_tune_plan(cfg: Dict[str, Any], logger: Logger) -> None:
+    """Write a Vertex AI tuning job request plan without calling GCP."""
+    from selfllm.cloud.vertex_tuning import build_vertex_tuning_request
+    from selfllm.utils import save_json
+
+    plan = build_vertex_tuning_request(
+        project_id=cfg["project_id"],
+        location=cfg.get("location", "us-central1"),
+        base_model=cfg.get("base_model", "gemini-2.5-flash"),
+        training_dataset_uri=cfg["training_dataset_uri"],
+        validation_dataset_uri=cfg.get("validation_dataset_uri"),
+        tuned_model_display_name=cfg.get("tuned_model_display_name"),
+        adapter_size=cfg.get("adapter_size"),
+        epoch_count=cfg.get("epoch_count"),
+        learning_rate_multiplier=cfg.get("learning_rate_multiplier"),
+    )
+    plan_path = cfg.get("plan_output_path", "vertex_tuning_request.json")
+    save_json(plan, plan_path)
+    logger.info(f"Vertex tuning request plan saved to {plan_path}")
+    logger.info(f"Endpoint: {plan['endpoint']}")
+
+
+def cmd_rag_pack(cfg: Dict[str, Any], logger: Logger) -> None:
+    """Pack local retrieved context into a grounded prompt."""
+    from selfllm.cloud.rag_context import build_rag_prompt
+    from selfllm.utils import save_json
+
+    result = build_rag_prompt(
+        paths=cfg["docs"],
+        query=cfg["query"],
+        top_k=cfg.get("top_k", 5),
+        max_context_chars=cfg.get("max_context_chars", 6000),
+        chunk_words=cfg.get("chunk_words", 220),
+        overlap_words=cfg.get("overlap_words", 40),
+        extensions=cfg.get("extensions"),
+        system_instruction=cfg.get("system_instruction"),
+    )
+
+    prompt_path = Path(cfg["prompt_output_path"])
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text(result["prompt"], encoding="utf-8")
+    logger.info(f"Packed prompt saved to {prompt_path}")
+    logger.info(
+        f"Retrieved {len(result['sources'])} source chunks "
+        f"from {result['chunks_loaded']} loaded chunks"
+    )
+
+    manifest_path = cfg.get("manifest_output_path")
+    if manifest_path:
+        manifest = dict(result)
+        manifest.pop("prompt", None)
+        save_json(manifest, manifest_path)
+        logger.info(f"RAG manifest saved to {manifest_path}")
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -1374,6 +1631,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         "benchmark": cmd_benchmark,
         "dashboard": cmd_dashboard,
         "serve": cmd_serve,
+        "vertex-export": cmd_vertex_export,
+        "vertex-tune-plan": cmd_vertex_tune_plan,
+        "rag-pack": cmd_rag_pack,
     }
 
     handler = command_map[args.command]
