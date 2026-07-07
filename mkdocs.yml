@@ -32,7 +32,9 @@ theme:
 
 nav:
   - Home: index.md
+  - Pricing: pricing.md
   - Guides:
+      - Hosted API & Monetization: hosted-api.md
       - Custom Provider: CUSTOM_PROVIDER.md
   - Specifications:
       - SPEC v4: SPEC-v4.md
@@ -43,6 +45,7 @@ nav:
 
 markdown_extensions:
   - admonition
+  - attr_list
   - tables
   - toc:
       permalink: true

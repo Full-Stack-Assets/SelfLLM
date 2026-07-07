@@ -23,9 +23,11 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import torch
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
+
+from selfllm.serving.billing import BillingManager, QuotaExceeded
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +98,12 @@ _scheduler: Optional[Any] = None
 # `Authorization: Bearer <key>` -- this is what lets SelfLLM be registered as a
 # custom OpenAI-compatible provider. When unset, auth is disabled (open).
 _api_key: Optional[str] = os.environ.get("SELFLLM_API_KEY")
+
+# Tiered API keys, usage metering, and daily quotas (monetization layer).
+# Configured via SELFLLM_API_KEYS ("key:tier,..."), SELFLLM_UPGRADE_URL.
+# Coexists with the legacy single _api_key above: a legacy key authenticates
+# as before and is metered on the unlimited enterprise tier.
+_billing: BillingManager = BillingManager.from_env()
 
 # Safety cap: an endpoint never waits longer than this for a scheduled request
 # to finish, so a wedged/un-schedulable request cannot hang the connection.
@@ -421,29 +429,61 @@ async def chat_ui():
     return HTMLResponse(_CHAT_UI_HTML)
 
 
-async def _check_api_key(authorization: Optional[str] = Header(None)) -> None:
+async def _check_api_key(
+    authorization: Optional[str] = Header(None),
+) -> Optional[str]:
     """Bearer-token auth for the inference endpoints.
 
-    No-op when no API key is configured (open server). When a key is set,
-    requires ``Authorization: Bearer <key>`` and rejects anything else with 401
-    -- the standard scheme an OpenAI-compatible custom provider uses.
+    Returns the caller's API key (used by metering/quotas), or ``None`` when
+    the server is fully open. Auth sources, in order:
+
+    1. Legacy single key (``_api_key`` / ``SELFLLM_API_KEY`` /
+       ``serve(api_key=...)``) -- exact historical behavior, unlimited tier.
+    2. Tiered keys from the billing manager (``SELFLLM_API_KEYS``).
+
+    When neither is configured the server is open (no auth, no quotas).
     """
-    if _api_key is None:
-        return
-    expected = f"Bearer {_api_key}"
-    if authorization != expected:
+    if _api_key is not None and authorization == f"Bearer {_api_key}":
+        return _api_key
+
+    if _billing.enabled:
+        try:
+            return _billing.authenticate(authorization)
+        except PermissionError:
+            pass  # fall through to the shared 401 below
+    elif _api_key is None:
+        return None  # open server
+
+    raise HTTPException(
+        status_code=401,
+        detail="Invalid or missing API key.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def _enforce_quota(api_key: Optional[str]) -> None:
+    """Map a quota exhaustion to HTTP 402 with the upgrade link."""
+    try:
+        _billing.check_quota(api_key)
+    except QuotaExceeded as exc:
         raise HTTPException(
-            status_code=401,
-            detail="Invalid or missing API key.",
-            headers={"WWW-Authenticate": "Bearer"},
+            status_code=402,
+            detail=str(exc),
+            headers={"X-Upgrade-Url": exc.upgrade_url},
         )
 
 
-@app.post("/v1/chat/completions", dependencies=[Depends(_check_api_key)])
-async def chat_completions(request: ChatCompletionRequest):
+@app.post("/v1/chat/completions")
+async def chat_completions(
+    request: ChatCompletionRequest,
+    response: Response,
+    api_key: Optional[str] = Depends(_check_api_key),
+):
     """OpenAI-compatible chat completions endpoint.
 
-    Supports both streaming (SSE) and non-streaming responses.
+    Supports both streaming (SSE) and non-streaming responses. Usage is
+    metered per API key and daily tier quotas are enforced (402 with an
+    upgrade link when exhausted).
 
     Args:
         request: ChatCompletionRequest with messages and generation params.
@@ -453,10 +493,12 @@ async def chat_completions(request: ChatCompletionRequest):
         for streaming (SSE).
 
     Raises:
-        HTTPException: 503 if model is not loaded.
+        HTTPException: 503 if model is not loaded, 402 if out of quota.
     """
     if _model is None or _tokenizer is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
+
+    _enforce_quota(api_key)
 
     # Convert messages to prompt string
     prompt = _messages_to_prompt(request.messages)
@@ -466,6 +508,9 @@ async def chat_completions(request: ChatCompletionRequest):
     # reasoning strategy, returning its answer. Non-streaming.
     if request.reasoning:
         content = _run_reasoning(prompt, request.reasoning)
+        completion_count = len(_tokenizer.encode(content))
+        _billing.record(api_key, len(prompt_tokens), completion_count)
+        response.headers.update(_billing.rate_limit_headers(api_key))
         return ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
             created=int(time.time()),
@@ -477,14 +522,18 @@ async def chat_completions(request: ChatCompletionRequest):
             }],
             usage={
                 "prompt_tokens": len(prompt_tokens),
-                "completion_tokens": len(_tokenizer.encode(content)),
-                "total_tokens": len(prompt_tokens) + len(_tokenizer.encode(content)),
+                "completion_tokens": completion_count,
+                "total_tokens": len(prompt_tokens) + completion_count,
             },
         )
 
     if request.stream:
         return StreamingResponse(
-            _stream_generate(prompt_tokens, request),
+            _metered_stream(
+                _stream_generate(prompt_tokens, request),
+                api_key,
+                len(prompt_tokens),
+            ),
             media_type="text/event-stream",
         )
 
@@ -514,6 +563,9 @@ async def chat_completions(request: ChatCompletionRequest):
         response_text = generated_text[len(prompt) :]
         completion_tokens = max(0, len(output["sequences"][0]) - len(prompt_tokens))
 
+    _billing.record(api_key, len(prompt_tokens), completion_tokens)
+    response.headers.update(_billing.rate_limit_headers(api_key))
+
     return ChatCompletionResponse(
         id=req_id,
         created=int(time.time()),
@@ -533,8 +585,12 @@ async def chat_completions(request: ChatCompletionRequest):
     )
 
 
-@app.post("/v1/completions", dependencies=[Depends(_check_api_key)])
-async def completions(request: CompletionRequest):
+@app.post("/v1/completions")
+async def completions(
+    request: CompletionRequest,
+    response: Response,
+    api_key: Optional[str] = Depends(_check_api_key),
+):
     """Text completions endpoint.
 
     Args:
@@ -544,10 +600,12 @@ async def completions(request: CompletionRequest):
         JSON response with generated text and usage statistics.
 
     Raises:
-        HTTPException: 503 if model is not loaded.
+        HTTPException: 503 if model is not loaded, 402 if out of quota.
     """
     if _model is None or _tokenizer is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
+
+    _enforce_quota(api_key)
 
     prompt_tokens = _tokenizer.encode(request.prompt)
 
@@ -579,6 +637,9 @@ async def completions(request: CompletionRequest):
         generated_text = _tokenizer.decode(all_token_ids)
         response_text = generated_text[len(request.prompt) :]
         completion_tokens = max(0, len(output["sequences"][0]) - len(prompt_tokens))
+
+    _billing.record(api_key, len(prompt_tokens), completion_tokens)
+    response.headers.update(_billing.rate_limit_headers(api_key))
 
     return {
         "id": f"cmpl-{uuid.uuid4().hex[:12]}",
@@ -639,6 +700,28 @@ async def stats():
     return {"error": "Scheduler not initialized"}
 
 
+@app.get("/v1/usage")
+async def usage(api_key: Optional[str] = Depends(_check_api_key)):
+    """The calling key's metered usage, limits, and remaining quota today.
+
+    Returns a minimal note when the server runs open (no keys configured),
+    since there is no key to report against.
+    """
+    if api_key is None:
+        return {
+            "object": "usage",
+            "billing": "disabled",
+            "detail": "No API keys configured; the server is open and unmetered.",
+        }
+    return _billing.usage_report(api_key)
+
+
+@app.get("/v1/pricing")
+async def pricing():
+    """Public pricing table: tiers, daily quotas, and the upgrade link."""
+    return _billing.pricing()
+
+
 # --- Helpers ---
 
 
@@ -667,6 +750,28 @@ def _messages_to_prompt(messages: List[ChatMessage]) -> str:
             parts.append(f"Assistant: {msg.content}\n")
     parts.append("Assistant:")
     return "".join(parts)
+
+
+async def _metered_stream(
+    stream: AsyncGenerator[str, None],
+    api_key: Optional[str],
+    prompt_token_count: int,
+) -> AsyncGenerator[str, None]:
+    """Wrap an SSE stream to meter its usage against an API key.
+
+    Each SSE data event carries (approximately) one generated token, so the
+    event count doubles as the completion-token count -- close enough for
+    quota accounting without re-tokenizing the streamed text. Usage is
+    recorded when the stream finishes (or the client disconnects).
+    """
+    completion_events = 0
+    try:
+        async for chunk in stream:
+            if chunk.startswith("data:") and "[DONE]" not in chunk:
+                completion_events += 1
+            yield chunk
+    finally:
+        _billing.record(api_key, prompt_token_count, completion_events)
 
 
 async def _stream_generate(
@@ -887,18 +992,25 @@ def serve(
     """
     import uvicorn
 
-    global _model, _tokenizer, _scheduler, _api_key
+    global _model, _tokenizer, _scheduler, _api_key, _billing
 
     # Require a Bearer key on the inference endpoints when configured (arg wins
     # over the SELFLLM_API_KEY env var). Needed to register SelfLLM as a
     # custom provider.
     if api_key is not None:
         _api_key = api_key
-    if _api_key:
+
+    # Rebuild the billing/metering layer so SELFLLM_API_KEYS /
+    # SELFLLM_UPGRADE_URL set after import (e.g. by a launcher) take effect.
+    _billing = BillingManager.from_env()
+
+    if _api_key or _billing.enabled:
         logger.info("API key auth ENABLED for /v1/* inference endpoints.")
+        if _billing.enabled:
+            logger.info("Tiered billing ENABLED (%d keys).", len(_billing._keys))
     else:
         logger.warning("API key auth DISABLED (open server). Set SELFLLM_API_KEY "
-                       "or serve(api_key=...) before exposing publicly.")
+                       "or SELFLLM_API_KEYS before exposing publicly.")
 
     from selfllm.model.model import SelfImprovingLLM
     from selfllm.model.tokenizer import BPETokenizer

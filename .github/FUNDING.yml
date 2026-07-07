@@ -1,0 +1,11 @@
+# Sponsorship / funding channels for SelfLLM.
+#
+# The `github:` entry activates the repository's "Sponsor" button once the
+# account is enrolled in GitHub Sponsors (https://github.com/sponsors).
+# Uncomment / fill in additional channels as they are set up.
+
+github: [Full-Stack-Assets]
+# patreon: your-patreon-handle
+# ko_fi: your-kofi-handle
+# open_collective: your-collective
+# custom: ["https://full-stack-assets.github.io/SelfLLM/pricing/"]
