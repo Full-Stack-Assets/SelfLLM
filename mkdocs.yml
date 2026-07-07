@@ -35,6 +35,7 @@ nav:
   - Pricing: pricing.md
   - Guides:
       - Hosted API & Monetization: hosted-api.md
+      - Observability & Operations: observability.md
       - Custom Provider: CUSTOM_PROVIDER.md
   - Specifications:
       - SPEC v4: SPEC-v4.md

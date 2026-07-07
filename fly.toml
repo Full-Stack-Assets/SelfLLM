@@ -17,7 +17,8 @@ primary_region = 'dfw'
   processes = ['app']
 
 [[vm]]
-  memory = '1gb'
+  # torch plus a loaded model does not fit the old 256 MB (it OOMs on import),
+  # and the two memory keys conflicted. Give the inference VM real headroom.
+  memory = '2gb'
   cpu_kind = 'shared'
-  cpus = 1
-  memory_mb = 256
+  cpus = 2

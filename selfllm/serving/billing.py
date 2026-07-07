@@ -28,10 +28,15 @@ quotas) -- identical to the historical behavior.
 from __future__ import annotations
 
 import os
-import threading
 import time
 from dataclasses import dataclass
 from typing import Dict, Optional
+
+from selfllm.serving.usage_store import (
+    InMemoryUsageStore,
+    UsageStore,
+    usage_store_from_env,
+)
 
 __all__ = ["Tier", "BillingManager", "DEFAULT_TIERS", "DEFAULT_UPGRADE_URL"]
 
@@ -83,20 +88,6 @@ DEFAULT_TIERS: Dict[str, Tier] = {
 }
 
 
-@dataclass
-class _Usage:
-    """Mutable per-key usage counters for a single day."""
-
-    day: str
-    requests: int = 0
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-
-    @property
-    def total_tokens(self) -> int:
-        return self.prompt_tokens + self.completion_tokens
-
-
 def _today() -> str:
     """UTC day key used for the daily quota rollover."""
     return time.strftime("%Y-%m-%d", time.gmtime())
@@ -116,6 +107,7 @@ class BillingManager:
         keys: Optional[Dict[str, str]] = None,
         tiers: Optional[Dict[str, Tier]] = None,
         upgrade_url: str = DEFAULT_UPGRADE_URL,
+        store: Optional["UsageStore"] = None,
     ) -> None:
         self.tiers = dict(tiers) if tiers else dict(DEFAULT_TIERS)
         self.upgrade_url = upgrade_url
@@ -127,8 +119,9 @@ class BillingManager:
                     f"expected one of {sorted(self.tiers)}"
                 )
             self._keys[key] = tier_name
-        self._usage: Dict[str, _Usage] = {}
-        self._lock = threading.Lock()
+        # Usage counters live in a pluggable store so they can persist across
+        # restarts (SQLite) instead of resetting to zero (in-memory default).
+        self._store: UsageStore = store if store is not None else InMemoryUsageStore()
 
     # ------------------------------------------------------------------ #
     # Construction from environment
@@ -161,7 +154,9 @@ class BillingManager:
             keys[key] = tier_name
 
         upgrade_url = env.get("SELFLLM_UPGRADE_URL", DEFAULT_UPGRADE_URL)
-        return cls(keys=keys, upgrade_url=upgrade_url)
+        # SELFLLM_USAGE_DB -> durable SQLite metering; unset -> in-memory.
+        store = usage_store_from_env(env)
+        return cls(keys=keys, upgrade_url=upgrade_url, store=store)
 
     # ------------------------------------------------------------------ #
     # Auth
@@ -203,45 +198,27 @@ class BillingManager:
     # Metering + quota
     # ------------------------------------------------------------------ #
 
-    def _usage_for(self, key: str) -> _Usage:
-        """Return today's usage record for a key (rolls over at UTC midnight).
-
-        Caller must hold ``self._lock``.
-        """
-        day = _today()
-        usage = self._usage.get(key)
-        if usage is None or usage.day != day:
-            usage = _Usage(day=day)
-            self._usage[key] = usage
-        return usage
-
     def check_quota(self, key: Optional[str]) -> None:
         """Raise ``QuotaExceeded`` if the key is out of daily quota."""
         if key is None:
             return
         tier = self.tier_of(key)
-        with self._lock:
-            usage = self._usage_for(key)
-            if (
-                tier.requests_per_day is not None
-                and usage.requests >= tier.requests_per_day
-            ):
-                raise QuotaExceeded(
-                    f"Daily request quota exhausted for the '{tier.name}' tier "
-                    f"({tier.requests_per_day} requests/day). "
-                    f"Upgrade at {self.upgrade_url}",
-                    upgrade_url=self.upgrade_url,
-                )
-            if (
-                tier.tokens_per_day is not None
-                and usage.total_tokens >= tier.tokens_per_day
-            ):
-                raise QuotaExceeded(
-                    f"Daily token quota exhausted for the '{tier.name}' tier "
-                    f"({tier.tokens_per_day} tokens/day). "
-                    f"Upgrade at {self.upgrade_url}",
-                    upgrade_url=self.upgrade_url,
-                )
+        requests, prompt_tokens, completion_tokens = self._store.get(key, _today())
+        total_tokens = prompt_tokens + completion_tokens
+        if tier.requests_per_day is not None and requests >= tier.requests_per_day:
+            raise QuotaExceeded(
+                f"Daily request quota exhausted for the '{tier.name}' tier "
+                f"({tier.requests_per_day} requests/day). "
+                f"Upgrade at {self.upgrade_url}",
+                upgrade_url=self.upgrade_url,
+            )
+        if tier.tokens_per_day is not None and total_tokens >= tier.tokens_per_day:
+            raise QuotaExceeded(
+                f"Daily token quota exhausted for the '{tier.name}' tier "
+                f"({tier.tokens_per_day} tokens/day). "
+                f"Upgrade at {self.upgrade_url}",
+                upgrade_url=self.upgrade_url,
+            )
 
     def record(
         self, key: Optional[str], prompt_tokens: int = 0, completion_tokens: int = 0
@@ -249,11 +226,7 @@ class BillingManager:
         """Meter one request's usage against a key (no-op for open server)."""
         if key is None:
             return
-        with self._lock:
-            usage = self._usage_for(key)
-            usage.requests += 1
-            usage.prompt_tokens += int(prompt_tokens)
-            usage.completion_tokens += int(completion_tokens)
+        self._store.add(key, _today(), 1, int(prompt_tokens), int(completion_tokens))
 
     # ------------------------------------------------------------------ #
     # Reporting
@@ -262,56 +235,57 @@ class BillingManager:
     def usage_report(self, key: str) -> Dict:
         """Structured usage/limits/remaining report for ``/v1/usage``."""
         tier = self.tier_of(key)
-        with self._lock:
-            usage = self._usage_for(key)
-            remaining_requests = (
-                None
-                if tier.requests_per_day is None
-                else max(0, tier.requests_per_day - usage.requests)
-            )
-            remaining_tokens = (
-                None
-                if tier.tokens_per_day is None
-                else max(0, tier.tokens_per_day - usage.total_tokens)
-            )
-            return {
-                "object": "usage",
-                "tier": tier.name,
-                "day": usage.day,
-                "requests": usage.requests,
-                "prompt_tokens": usage.prompt_tokens,
-                "completion_tokens": usage.completion_tokens,
-                "total_tokens": usage.total_tokens,
-                "limits": {
-                    "requests_per_day": tier.requests_per_day,
-                    "tokens_per_day": tier.tokens_per_day,
-                },
-                "remaining": {
-                    "requests": remaining_requests,
-                    "tokens": remaining_tokens,
-                },
-                "upgrade_url": self.upgrade_url,
-            }
+        day = _today()
+        requests, prompt_tokens, completion_tokens = self._store.get(key, day)
+        total_tokens = prompt_tokens + completion_tokens
+        remaining_requests = (
+            None
+            if tier.requests_per_day is None
+            else max(0, tier.requests_per_day - requests)
+        )
+        remaining_tokens = (
+            None
+            if tier.tokens_per_day is None
+            else max(0, tier.tokens_per_day - total_tokens)
+        )
+        return {
+            "object": "usage",
+            "tier": tier.name,
+            "day": day,
+            "requests": requests,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "limits": {
+                "requests_per_day": tier.requests_per_day,
+                "tokens_per_day": tier.tokens_per_day,
+            },
+            "remaining": {
+                "requests": remaining_requests,
+                "tokens": remaining_tokens,
+            },
+            "upgrade_url": self.upgrade_url,
+        }
 
     def rate_limit_headers(self, key: Optional[str]) -> Dict[str, str]:
         """OpenAI-style X-RateLimit-* headers for responses (empty if open)."""
         if key is None:
             return {}
         tier = self.tier_of(key)
-        with self._lock:
-            usage = self._usage_for(key)
-            headers: Dict[str, str] = {}
-            if tier.requests_per_day is not None:
-                headers["X-RateLimit-Limit-Requests"] = str(tier.requests_per_day)
-                headers["X-RateLimit-Remaining-Requests"] = str(
-                    max(0, tier.requests_per_day - usage.requests)
-                )
-            if tier.tokens_per_day is not None:
-                headers["X-RateLimit-Limit-Tokens"] = str(tier.tokens_per_day)
-                headers["X-RateLimit-Remaining-Tokens"] = str(
-                    max(0, tier.tokens_per_day - usage.total_tokens)
-                )
-            return headers
+        requests, prompt_tokens, completion_tokens = self._store.get(key, _today())
+        total_tokens = prompt_tokens + completion_tokens
+        headers: Dict[str, str] = {}
+        if tier.requests_per_day is not None:
+            headers["X-RateLimit-Limit-Requests"] = str(tier.requests_per_day)
+            headers["X-RateLimit-Remaining-Requests"] = str(
+                max(0, tier.requests_per_day - requests)
+            )
+        if tier.tokens_per_day is not None:
+            headers["X-RateLimit-Limit-Tokens"] = str(tier.tokens_per_day)
+            headers["X-RateLimit-Remaining-Tokens"] = str(
+                max(0, tier.tokens_per_day - total_tokens)
+            )
+        return headers
 
     def pricing(self) -> Dict:
         """Public pricing table for ``/v1/pricing`` and the docs site."""
