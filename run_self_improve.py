@@ -288,7 +288,7 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # Step 3b — Wrap with compile_model() for future-proof acceleration
     # ------------------------------------------------------------------ #
-    # Zero-risk: degrades gracefully to eager on Python 3.12 + torch 2.2.
+    # Zero-risk: degrades gracefully to eager wherever torch.compile is unavailable.
     # Will auto-activate on Python ≤3.11 or any CUDA environment.
     # Must come AFTER inject_lora() so LoRA params are part of the compiled graph.
     model = compile_model(model, mode="reduce-overhead")

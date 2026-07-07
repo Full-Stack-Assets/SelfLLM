@@ -4,7 +4,7 @@
 
 SelfLLM is a single pure-Python/PyTorch package (`selfllm`). There is **no database, cache, queue, or docker-compose** — nothing needs to be running just to develop or test. Everything runs CPU-only (CI runs on CPU; CUDA is optional and CUDA tests auto-skip).
 
-The startup update script already installs all dependencies (CPU `torch==2.2.2+cpu`, `numpy==1.26.4`, `pip install -e ".[dev]"`, and `ruff==0.4.4`). Do not reinstall unless something is missing.
+The startup update script already installs all dependencies (CPU `torch==2.12.1+cpu`, `numpy==1.26.4`, `pip install -e ".[dev]"`, and `ruff==0.4.4`). Do not reinstall unless something is missing.
 
 ### Gotchas
 
