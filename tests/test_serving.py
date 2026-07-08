@@ -441,6 +441,18 @@ class TestServerEndpoints:
             assert data["status"] == "healthy"
             assert data["model_loaded"] is False
 
+    def test_security_headers_present(self):
+        """Every response carries the standard security headers."""
+        from fastapi.testclient import TestClient
+        from selfllm.serving.server import app
+
+        with TestClient(app) as client:
+            h = client.get("/health").headers
+            assert h["X-Content-Type-Options"] == "nosniff"
+            assert h["X-Frame-Options"] == "SAMEORIGIN"
+            assert "Content-Security-Policy" in h
+            assert "Strict-Transport-Security" in h
+
     def test_root_redirects_to_chat(self):
         """/ redirects to the browser chat UI."""
         from fastapi.testclient import TestClient

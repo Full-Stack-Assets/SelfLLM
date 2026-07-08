@@ -116,6 +116,31 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="SelfLLM API", version="2.0.0", lifespan=lifespan)
 
+
+# Security headers on every response (back-end hardening). The CSP permits
+# inline styles/scripts because the built-in /chat UI is a single self-contained
+# HTML page; everything else is locked to same-origin.
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "SAMEORIGIN",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Strict-Transport-Security": "max-age=63072000; includeSubDomains",
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+        "connect-src 'self'; base-uri 'none'"
+    ),
+}
+
+
+@app.middleware("http")
+async def _security_headers(request, call_next):
+    """Attach standard security headers to every response."""
+    response = await call_next(request)
+    for header, value in _SECURITY_HEADERS.items():
+        response.headers.setdefault(header, value)
+    return response
+
 _CHAT_UI_HTML = """<!doctype html>
 <html lang="en">
 <head>

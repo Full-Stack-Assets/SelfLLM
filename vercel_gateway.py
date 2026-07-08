@@ -30,14 +30,20 @@ import os
 
 import httpx
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+# Largest request body the proxy will forward (protects the upstream from
+# oversized payloads at the edge).
+MAX_PROXY_BODY_BYTES = 10 * 1024 * 1024  # 10 MiB
 
 UPSTREAM_URL = os.environ.get(
     "SELFLLM_UPSTREAM_URL", "https://selfllm.fly.dev"
 ).rstrip("/")
-UPGRADE_URL = os.environ.get(
-    "SELFLLM_UPGRADE_URL", "https://full-stack-assets.github.io/SelfLLM/pricing/"
-)
+# Where the "get a key / upgrade" CTAs point. Defaults to the pricing section
+# on this same page (never 404s); operators set this to their real payment
+# link (e.g. a Stripe Payment Link) in production.
+UPGRADE_URL = os.environ.get("SELFLLM_UPGRADE_URL", "/#pricing")
 DOCS_URL = "https://full-stack-assets.github.io/SelfLLM/"
 REPO_URL = "https://github.com/Full-Stack-Assets/SelfLLM"
 
@@ -68,6 +74,94 @@ PRICING_TIERS = [
 ]
 
 app = FastAPI(title="SelfLLM Gateway", version="1.0.0")
+
+# Security headers applied to every response (front-end hardening). The landing
+# page uses inline <style>, so style-src allows 'unsafe-inline'; everything else
+# is locked to same-origin.
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "SAMEORIGIN",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Strict-Transport-Security": "max-age=63072000; includeSubDomains",
+    "Content-Security-Policy": (
+        "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; base-uri 'none'; frame-ancestors 'self'"
+    ),
+}
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for header, value in _SECURITY_HEADERS.items():
+        response.headers.setdefault(header, value)
+    return response
+
+
+# Inline SVG favicon so browsers don't log a 404 on every page load.
+_FAVICON_SVG = (
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>"
+    "<rect width='64' height='64' rx='12' fill='#4f7cff'/>"
+    "<text x='50%' y='55%' text-anchor='middle' dominant-baseline='middle' "
+    "font-family='system-ui,sans-serif' font-size='34' font-weight='700' "
+    "fill='white'>S</text></svg>"
+)
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> Response:
+    """Serve a favicon (prevents a 404 on the browser's automatic request)."""
+    return Response(content=_FAVICON_SVG, media_type="image/svg+xml")
+
+
+@app.get("/robots.txt", include_in_schema=False)
+async def robots() -> Response:
+    """Allow crawling of the marketing pages; keep the API surface out."""
+    body = "User-agent: *\nAllow: /\nDisallow: /v1/\nDisallow: /metrics\n"
+    return Response(content=body, media_type="text/plain")
+
+
+def _render_error_page(status_code: int, message: str) -> str:
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>{status_code} — SelfLLM</title>
+<style>
+  html {{ color-scheme: light dark; }}
+  body {{ font: 16px/1.6 system-ui, sans-serif; background: #0b1020; color: #e6e9f2;
+         display: grid; place-items: center; min-height: 100vh; margin: 0;
+         text-align: center; padding: 1.5rem; }}
+  h1 {{ font-size: 3rem; margin: 0 0 .3rem; color: #7aa2ff; }}
+  a {{ color: #8fb0ff; }}
+</style></head>
+<body><main>
+  <h1>{status_code}</h1>
+  <p>{message}</p>
+  <p><a href="/">← Back to SelfLLM</a></p>
+</main></body></html>"""
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_exception_handler(request: Request, exc: StarletteHTTPException):
+    """Branded error responses: HTML for browsers, JSON for API clients.
+
+    Turns the bare ``{"detail": "Not Found"}`` (and other HTTP errors) into a
+    styled page for humans and a structured error object for programmatic
+    callers, keyed off the ``Accept`` header.
+    """
+    wants_html = "text/html" in request.headers.get("accept", "")
+    if wants_html:
+        message = exc.detail if exc.status_code != 404 else (
+            "That page doesn't exist. The API lives under /v1/."
+        )
+        return HTMLResponse(
+            _render_error_page(exc.status_code, message), status_code=exc.status_code
+        )
+    return JSONResponse(
+        {"error": {"message": exc.detail, "type": "http_error",
+                   "status": exc.status_code}},
+        status_code=exc.status_code,
+    )
 
 
 def _fmt_quota(value) -> str:
@@ -160,9 +254,12 @@ _LANDING_HTML = """<!doctype html>
     opt-in test-time-compute reasoning.</p>
   </section>
 
-  <section>
+  <section id="pricing">
     <h2>Pricing</h2>
     <div class="grid">{pricing_cards}</div>
+    <p style="color:#9aa3b8;margin-top:1rem">Quotas reset daily. Need a key?
+    Reach out via the <a href="{repo_url}">GitHub repo</a> — or self-host the
+    whole stack, it's MIT-licensed.</p>
   </section>
 
   <section>
@@ -286,6 +383,12 @@ async def proxy_v1(path: str, request: Request) -> Response:
         if k.lower() not in _HOP_BY_HOP
     }
     body = await request.body()
+    if len(body) > MAX_PROXY_BODY_BYTES:
+        return JSONResponse(
+            {"error": {"message": "Request body too large.",
+                       "type": "payload_too_large"}},
+            status_code=413,
+        )
     try:
         async with httpx.AsyncClient(timeout=300.0) as client:
             upstream = await client.request(
