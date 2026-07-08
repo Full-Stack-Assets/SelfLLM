@@ -28,6 +28,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from selfllm.serving.billing import BillingManager, QuotaExceeded
+from selfllm.serving.metrics import METRICS
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +124,30 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="SelfLLM API", version="2.0.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def _metrics_middleware(request, call_next):
+    """Time every request and record it into the Prometheus collector.
+
+    Uses the matched route template (e.g. ``/v1/chat/completions``) as the
+    ``endpoint`` label so metric cardinality stays bounded regardless of
+    query strings or path parameters.
+    """
+    METRICS.inc_in_flight()
+    start = time.perf_counter()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        elapsed = time.perf_counter() - start
+        route = request.scope.get("route")
+        endpoint = getattr(route, "path", None) or request.url.path
+        METRICS.dec_in_flight()
+        METRICS.observe_request(endpoint, request.method, status, elapsed)
+
 
 _CHAT_UI_HTML = """<!doctype html>
 <html lang="en">
@@ -686,6 +711,20 @@ async def health():
         "model_loaded": _model is not None,
         "scheduler_active": _scheduler is not None,
     }
+
+
+@app.get("/metrics")
+async def metrics() -> Response:
+    """Prometheus text-exposition metrics for scraping.
+
+    Left unauthenticated by convention so a Prometheus scraper on the internal
+    network can read it; restrict at the network/ingress layer if the endpoint
+    is exposed publicly.
+    """
+    return Response(
+        content=METRICS.render(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
 
 
 @app.get("/v1/stats", dependencies=[Depends(_check_api_key)])

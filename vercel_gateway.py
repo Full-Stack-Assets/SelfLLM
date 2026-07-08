@@ -229,6 +229,28 @@ async def health() -> dict:
     return {"status": "healthy", "role": "gateway", "upstream": UPSTREAM_URL}
 
 
+@app.get("/metrics")
+async def metrics(request: Request) -> Response:
+    """Proxy the upstream's Prometheus metrics so a single scrape target
+    (this gateway) covers the whole system."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            upstream = await client.get(f"{UPSTREAM_URL}/metrics")
+    except httpx.HTTPError:
+        return Response(
+            content="# upstream metrics unavailable\n",
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+            status_code=502,
+        )
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        media_type=upstream.headers.get(
+            "content-type", "text/plain; version=0.0.4; charset=utf-8"
+        ),
+    )
+
+
 @app.get("/pricing")
 async def pricing() -> dict:
     """Pricing tiers as JSON (display mirror; upstream /v1/pricing is live)."""
