@@ -9,13 +9,16 @@ version = "0.1.0"
 description = "A recursively self-improving foundation language model"
 readme = "README.md"
 requires-python = ">=3.9"
-# Runtime dependencies needed to import and serve selfllm.serving.server:app.
-# Deliberately slim: the default CUDA torch build plus dev/UI extras (gradio,
-# pytest) blow past Vercel's serverless function size limit, so torch is pinned
-# to the CPU wheel (see [tool.uv.sources] below) and test/UI-only packages are
-# left out. The full set lives in requirements.txt / setup.py extras.
+# Runtime dependencies for the Vercel deployment, which serves the slim
+# torch-free gateway (vercel_gateway:app): landing page, pricing, and a
+# reverse proxy to the Fly.io inference API. torch is deliberately ABSENT --
+# even the CPU wheel pushes the function bundle to ~780 MB, over Vercel's
+# 500 MB limit (this is why the previous full-server deployments all failed).
+# Inference runs on Fly.io (fly.toml); the full training/serving dependency
+# set lives in requirements.txt / setup.py. CI installs torch and numpy
+# explicitly before `pip install -e ".[dev]"`, so their absence here does not
+# affect CI.
 dependencies = [
-    "torch>=2.6.0",
     "numpy>=1.26.0",
     "fastapi>=0.109.1",
     "uvicorn>=0.30.1",
@@ -45,20 +48,10 @@ dev = [
 # from the repository root, matching the prior requirements.txt-based build.
 package = false
 
-[tool.uv.sources]
-# Pull the CPU-only torch wheel instead of the default build, which bundles
-# multi-GB NVIDIA CUDA libraries and exceeds Vercel's function size limit.
-torch = { index = "pytorch-cpu" }
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
 # Vercel deployment configuration.
 #
-# Tells the Vercel Python builder which ASGI application to serve. The FastAPI
-# `app` is defined in selfllm/serving/server.py (and re-exported from
-# selfllm/serving/__init__.py); point at the defining module directly.
+# Serve the slim gateway app (no torch) instead of the full inference server:
+# the full server's torch dependency cannot fit Vercel's 500 MB function
+# limit. The gateway proxies /v1/* to the Fly.io inference deployment.
 [tool.vercel]
-entrypoint = "selfllm.serving.server:app"
+entrypoint = "vercel_gateway:app"
