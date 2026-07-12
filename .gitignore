@@ -26,3 +26,7 @@ personalized_model/
 /rt.log
 /rec.log
 /result.json
+
+# Generated training runs from cloud execution
+/real_model_max_info/
+/real_model_max_info_30books/
