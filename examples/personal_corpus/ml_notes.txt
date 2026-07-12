@@ -1,0 +1,17 @@
+Notes on Machine Learning Practice
+
+Supervised learning is pattern matching with guardrails. The model finds statistical structure in labeled examples, but the label definition is where most projects succeed or fail. Before tuning hyperparameters, I verify that the labels mean the same thing across annotators and time periods.
+
+Feature engineering still matters even in the era of large models. For structured problems, thoughtful features reduce data requirements and make failures easier to diagnose. For text, tokenization and context window choices shape what the model can even see.
+
+Evaluation should mirror deployment. A high offline score on a static test set is encouraging, but I also track slice metrics: new users, rare categories, and adversarial inputs. Regression tests for model behavior are as important as unit tests for code.
+
+I use baselines aggressively. A linear model or simple heuristic sets the floor. If a complex architecture cannot beat a sane baseline by a meaningful margin, the problem may be data, framing, or metric choice—not model capacity.
+
+Training loops need observability: loss curves, gradient norms, and sample outputs at checkpoints. When loss decreases but quality stalls, I inspect generations manually. Numbers summarize; examples explain.
+
+For personalization, fine-tuning on user-specific text adapts style and domain vocabulary without retraining everything from scratch. LoRA-style adapters make that practical on modest hardware by updating a small set of weights while preserving general capabilities in the base model.
+
+Responsible deployment includes documenting known limitations, monitoring drift, and making it easy to roll back. A model that helps most of the time but fails silently on edge cases is worse than one that admits uncertainty.
+
+I think of ML systems as software products with statistical components. Pipelines, versioning, and reproducibility are not optional extras. They are how teams earn trust in what ships.

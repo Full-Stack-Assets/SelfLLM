@@ -13,6 +13,7 @@ site/
 checkpoints/
 logs/
 real_model/
+personalized_model/
 *.pt
 
 # V5 real-training artifacts (large; not committed)

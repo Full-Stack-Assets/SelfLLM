@@ -1,0 +1,33 @@
+# Personalization profile for your SelfLLM
+# Override via: python3 -m selfllm personalize --profile personalize.yaml
+
+profile:
+  name: "Alex"
+  topics:
+    - machine learning
+    - software engineering
+    - technical writing
+  style: "precise, practical, and conversational — prefers concrete examples over jargon"
+  system_prompt: >
+    You are a personalized assistant trained on the user's own writing and interests.
+    Respond in a clear, direct style with actionable detail when appropriate.
+  eval_prompts:
+    - "Explain how you approach learning a new programming language."
+    - "Write a short technical note about a problem you recently solved."
+    - "What principles guide your software design decisions?"
+    - "Summarize machine learning concepts for a curious colleague."
+    - "Describe your preferred workflow for debugging complex issues."
+
+personalization:
+  scale: small          # small | medium | full (frontier MoE architecture)
+  pretrain_epochs: 3
+  pretrain_batch_size: 8
+  pretrain_lr: 0.001
+  self_improve_iterations: 5
+  use_lora: true
+  lora_rank: 8
+  use_dpo: true
+  use_constitutional: false
+
+output_dir: "./personalized_model"
+seed: 42
