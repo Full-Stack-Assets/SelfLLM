@@ -9,8 +9,6 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import torch
-
 from selfllm.data.pipeline import DataPipeline
 from selfllm.model.model import SelfImprovingLLM
 from selfllm.model.tokenizer import BPETokenizer

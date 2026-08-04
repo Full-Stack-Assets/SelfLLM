@@ -60,7 +60,7 @@ class UserProfile:
 
         if self.name and self.name != "User":
             prompts.append(f"Write a short introduction as {self.name} would.")
-            prompts.append(f"How would you describe your expertise to a colleague?")
+            prompts.append("How would you describe your expertise to a colleague?")
 
         if not prompts:
             prompts = [
