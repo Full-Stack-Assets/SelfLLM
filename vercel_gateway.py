@@ -44,7 +44,7 @@ UPSTREAM_URL = os.environ.get(
 # on this same page (never 404s); operators set this to their real payment
 # link (e.g. a Stripe Payment Link) in production.
 UPGRADE_URL = os.environ.get("SELFLLM_UPGRADE_URL", "/#pricing")
-DOCS_URL = "https://full-stack-assets.github.io/SelfLLM/"
+DOCS_URL = "https://fullstackassets.com/SelfLLM/"
 REPO_URL = "https://github.com/Full-Stack-Assets/SelfLLM"
 
 # Mirrors selfllm/serving/billing.py DEFAULT_TIERS (display copy only; the
