@@ -1,6 +1,6 @@
 site_name: SelfLLM
 site_description: A recursively self-improving foundation language model
-site_url: https://full-stack-assets.github.io/SelfLLM/
+site_url: https://fullstackassets.com/SelfLLM/
 repo_url: https://github.com/Full-Stack-Assets/SelfLLM
 repo_name: Full-Stack-Assets/SelfLLM
 docs_dir: docs
